@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { Activity, ArrowDownLeft, ArrowUpRight, Bell, CheckCircle2, ChevronDown, CircleHelp, Command, CreditCard, Database, LayoutDashboard, LogOut, Menu, MonitorSmartphone, Plus, RefreshCw, Search, Settings, ShieldCheck, Smartphone, Users, Wallet, Wifi, X } from "lucide-react";
-import { api } from "./api";
+import { ApiError, api } from "./api";
+import { resolveRoute } from "./route-state.js";
 
 type Device = { id: string; deviceName: string; status: string; lastSeenAt?: string | null; appVersion?: string | null; model?: string | null; automationEnabled: boolean; executionState: string };
 type Me = { id: string; phone: string; role: string; tokenBalance: number; devices: Device[]; subscriptions: any[] };
 type Tx = { id: string; phoneNumber: string; packageName: string; amountKes: string; status: string; lastSyncedAt: string; device: { deviceName: string } };
+type AdminOverview = { users: number; devices: number; pendingPayments: number; activeSubscriptions: number; queuedCommands: number };
 
 const nav = [
   { label: "Overview", icon: LayoutDashboard, group: "WORKSPACE" },
@@ -26,12 +28,18 @@ function time(value?: string | null) { return value ? new Date(value).toLocaleSt
 
 export default function App() {
   const [page, setPage] = useState("Overview");
+  const [pathname, setPathname] = useState(window.location.pathname);
   const [me, setMe] = useState<Me | null>(null);
+  const [adminSession, setAdminSession] = useState<{ username: string } | null>(null);
+  const [adminOverview, setAdminOverview] = useState<AdminOverview | null>(null);
+  const [authReady, setAuthReady] = useState(false);
   const [transactions, setTransactions] = useState<Tx[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [loginPhone, setLoginPhone] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
+  const [adminUsername, setAdminUsername] = useState("kish");
+  const [adminPassword, setAdminPassword] = useState("");
   const [registering, setRegistering] = useState(false);
   const [pairCode, setPairCode] = useState("");
   const [showPair, setShowPair] = useState(false);
@@ -42,20 +50,79 @@ export default function App() {
   const [editingPlan, setEditingPlan] = useState<any | null>(null);
   const [savingPlan, setSavingPlan] = useState(false);
 
+  function navigate(to: string, replace = false) {
+    if (replace) window.history.replaceState({}, "", to);
+    else window.history.pushState({}, "", to);
+    setPathname(window.location.pathname);
+  }
+
   async function refresh() {
-    if (!localStorage.getItem("bingwa_token")) return;
+    const savedToken = localStorage.getItem("bingwa_token");
+    if (!savedToken) {
+      setMe(null); setAdminSession(null); setAdminOverview(null); setAuthReady(true);
+      return;
+    }
     setLoading(true); setError("");
     try {
-      const [profile, tx, plans] = await Promise.all([
-        api<Me>("/api/me"),
-        api<Tx[]>("/api/transactions"),
-        api<any[]>("/api/data-plans")
-      ]);
-      setMe(profile); setTransactions(tx); setDataPlans(plans);
-    } catch (e) { setError(e instanceof Error ? e.message : "Could not load portal data"); }
-    finally { setLoading(false); }
+      let profile: Me;
+      try {
+        profile = await api<Me>("/api/me");
+      } catch (profileError) {
+        if (!(profileError instanceof ApiError) || profileError.status !== 401) throw profileError;
+        try {
+          const overview = await api<AdminOverview>("/api/admin/overview");
+          setMe(null); setAdminSession({ username: localStorage.getItem("bingwa_admin_username") || "Administrator" });
+          setAdminOverview(overview); setTransactions([]); setDataPlans([]); setAuthReady(true);
+          return;
+        } catch (adminError) {
+          if (adminError instanceof ApiError && (adminError.status === 401 || adminError.status === 403)) {
+            localStorage.removeItem("bingwa_token"); localStorage.removeItem("bingwa_admin_username");
+            setMe(null); setAdminSession(null); setAdminOverview(null); setTransactions([]); setDataPlans([]);
+            setAuthReady(true);
+            return;
+          }
+          throw adminError;
+        }
+      }
+
+      if (profile.role !== "USER" && profile.role !== "ADMIN") {
+        localStorage.removeItem("bingwa_token"); localStorage.removeItem("bingwa_admin_username");
+        setMe(null); setAdminSession(null); setAdminOverview(null); setAuthReady(true);
+        return;
+      }
+      setMe(profile); setAdminSession(null); localStorage.removeItem("bingwa_admin_username");
+      if (profile.role === "ADMIN") {
+        setAdminOverview(await api<AdminOverview>("/api/admin/overview"));
+        setTransactions([]); setDataPlans([]);
+      } else {
+        setAdminOverview(null);
+        const [txResult, plansResult] = await Promise.allSettled([
+          api<Tx[]>("/api/transactions"), api<any[]>("/api/data-plans")
+        ]);
+        if (txResult.status === "fulfilled") setTransactions(txResult.value);
+        if (plansResult.status === "fulfilled") setDataPlans(plansResult.value);
+        const failedResult = txResult.status === "rejected" ? txResult : plansResult.status === "rejected" ? plansResult : null;
+        if (failedResult) setError(failedResult.reason instanceof Error ? failedResult.reason.message : "Could not load portal data");
+      }
+      setAuthReady(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not load portal data");
+      setAuthReady(true);
+    } finally { setLoading(false); }
   }
-  useEffect(() => { void refresh(); }, []);
+
+  useEffect(() => {
+    const onPopState = () => { setPathname(window.location.pathname); void refresh(); };
+    window.addEventListener("popstate", onPopState);
+    void refresh();
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  const role = adminSession ? "ADMIN" : me?.role ?? null;
+  const route = resolveRoute(pathname, role);
+  useEffect(() => {
+    if (route.view === "redirect") navigate(route.to, true);
+  }, [pathname, role]);
 
   async function auth() {
     setError("");
@@ -64,8 +131,22 @@ export default function App() {
         method: "POST", body: JSON.stringify({ phone: loginPhone, password: loginPassword })
       });
       localStorage.setItem("bingwa_token", result.token);
+      localStorage.removeItem("bingwa_admin_username");
+      setAuthReady(false); navigate(result.user?.role === "ADMIN" ? "/admin" : "/");
       await refresh();
     } catch (e) { setError(e instanceof Error ? e.message : "Sign in failed"); }
+  }
+
+  async function adminAuth(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setError("");
+    try {
+      const result = await api<any>("/api/auth/admin/login", {
+        method: "POST", body: JSON.stringify({ username: adminUsername, password: adminPassword })
+      });
+      localStorage.setItem("bingwa_token", result.token);
+      localStorage.setItem("bingwa_admin_username", result.user.username);
+      setAdminPassword(""); setAuthReady(false); navigate("/admin"); await refresh();
+    } catch (e) { setError(e instanceof Error ? e.message : "Administrator sign in failed"); }
   }
   async function createPairCode() {
     try {
@@ -89,7 +170,26 @@ export default function App() {
     catch (e) { setError(e instanceof Error ? e.message : "Plan could not be saved"); } finally { setSavingPlan(false); }
   }
 
-  function logout() { localStorage.removeItem("bingwa_token"); setMe(null); setTransactions([]); }
+  function logout() {
+    localStorage.removeItem("bingwa_token"); localStorage.removeItem("bingwa_admin_username");
+    setMe(null); setAdminSession(null); setAdminOverview(null); setTransactions([]); setDataPlans([]); setAuthReady(true);
+    navigate(adminSession || me?.role === "ADMIN" ? "/admin" : "/login");
+  }
+
+  if (!authReady) return <div className="auth-shell"><div className="auth-card"><div className="brand-mark">B</div><p className="muted">Restoring your secure session…</p></div></div>;
+
+  if (route.view === "admin-dashboard") return adminOverview
+    ? <AdminDashboard overview={adminOverview} username={adminSession?.username || me?.phone || "Administrator"} onLogout={logout} />
+    : <div className="auth-shell"><div className="auth-card"><h1>Admin dashboard unavailable</h1><p className="muted">{error || "The overview could not be loaded."}</p><button className="primary full" onClick={()=>void refresh()}>Retry</button><button className="text-button full" onClick={logout}>Sign out</button></div></div>;
+
+  if (route.view === "admin-login") return <AdminLogin username={adminUsername} password={adminPassword} error={error} onUsername={setAdminUsername} onPassword={setAdminPassword} onSubmit={adminAuth} onCustomerLogin={() => { setError(""); navigate("/login"); }} />;
+
+  if (route.view === "invalid-session") {
+    localStorage.removeItem("bingwa_token"); localStorage.removeItem("bingwa_admin_username");
+    return <div className="auth-shell"><div className="auth-card"><h1>Account role is invalid</h1><p className="muted">Please sign in again or contact support.</p><button className="primary full" onClick={logout}>Return to sign in</button></div></div>;
+  }
+
+  if (route.view === "redirect") return null;
 
   if (!me) return <div className="auth-shell">
     <div className="auth-card">
@@ -101,6 +201,7 @@ export default function App() {
       <label>Password</label><input type="password" value={loginPassword} onChange={e=>setLoginPassword(e.target.value)} placeholder="At least 10 characters" autoComplete={registering?"new-password":"current-password"} />
       <button className="primary full" onClick={auth}>{registering ? "Create account" : "Sign in"}</button>
       <button className="text-button full" onClick={()=>setRegistering(!registering)}>{registering ? "Already have an account? Sign in" : "New to Bingwa? Create an account"}</button>
+      {!registering&&<button className="text-button full" onClick={()=>navigate("/admin")}>Administrator sign in</button>}
       <div className="auth-foot"><ShieldCheck size={15}/> Secure account access · Phone verification setup required before production</div>
     </div>
   </div>;
@@ -162,6 +263,26 @@ export default function App() {
       <div className="modal-actions"><button type="button" className="secondary" onClick={()=>setEditingPlan(null)}>Cancel</button><button className="primary" disabled={savingPlan}>{savingPlan?"Saving…":"Save new version"}</button></div></form></div>}
     {showPair&&<div className="modal-backdrop"><div className="modal"><button className="icon-button modal-close" onClick={()=>setShowPair(false)}><X size={18}/></button><div className="modal-icon"><Smartphone size={23}/></div><div className="eyebrow">LINK A NEW DEVICE</div><h2>Your one-time linking code</h2><p className="muted">On your Android phone, open Bingwa Sokoni Automation → Settings → Portal linking and enter this code. It expires in 5 minutes.</p><div className="pair-code">{pairCode.split("").join(" ")}</div><div className="notice compact"><ShieldCheck size={17}/><span>Code only. It can be redeemed once; a device credential is issued securely in the background after successful linking.</span></div><button className="primary full" onClick={()=>{navigator.clipboard?.writeText(pairCode);}}>Copy code</button><button className="text-button full" onClick={()=>setShowPair(false)}>Done</button></div></div>}
   </div>;
+}
+function AdminLogin({username,password,error,onUsername,onPassword,onSubmit,onCustomerLogin}:{username:string;password:string;error:string;onUsername:(value:string)=>void;onPassword:(value:string)=>void;onSubmit:(event:FormEvent<HTMLFormElement>)=>void;onCustomerLogin:()=>void}){
+  return <div className="auth-shell"><form className="auth-card" onSubmit={onSubmit}>
+    <div className="brand-mark">B</div><div className="eyebrow">BINGWA SOKONI · ADMIN</div>
+    <h1>Administrator sign in</h1><p className="muted">Use the administrator credentials configured securely for this service.</p>
+    {error&&<div className="alert">{error}</div>}
+    <label>Username</label><input value={username} onChange={e=>onUsername(e.target.value)} autoComplete="username" required maxLength={80}/>
+    <label>Password</label><input type="password" value={password} onChange={e=>onPassword(e.target.value)} autoComplete="current-password" required/>
+    <button className="primary full" type="submit">Sign in to admin</button>
+    <button className="text-button full" type="button" onClick={onCustomerLogin}>Customer sign in</button>
+    <div className="auth-foot"><ShieldCheck size={15}/> Administrator access is checked by the API.</div>
+  </form></div>;
+}
+function AdminDashboard({overview,username,onLogout}:{overview:AdminOverview;username:string;onLogout:()=>void}){
+  return <div className="app-shell"><main className="main"><header className="topbar"><div className="breadcrumbs">Bingwa Sokoni <span>/</span> <strong>Administration</strong></div><div className="top-actions"><span>{username}</span><button className="secondary" onClick={onLogout}><LogOut size={15}/> Sign out</button></div></header>
+    <div className="content"><div className="page-heading"><div><div className="eyebrow">SECURE ADMINISTRATION</div><h1>Admin dashboard</h1><p className="muted">Server-authorized overview of portal activity.</p></div></div>
+      <div className="metric-grid"><Metric icon={<Users/>} label="Users" value={String(overview.users)} note="Registered accounts"/><Metric icon={<Smartphone/>} label="Devices" value={String(overview.devices)} note="Non-revoked devices"/><Metric icon={<CreditCard/>} label="Pending payments" value={String(overview.pendingPayments)} note="Awaiting verification"/><Metric icon={<Activity/>} label="Active subscriptions" value={String(overview.activeSubscriptions)} note="Currently active"/><Metric icon={<Command/>} label="Queued commands" value={String(overview.queuedCommands)} note="Waiting for device delivery"/></div>
+      <section className="panel"><div className="panel-heading"><div><h3>Administrator access</h3><p>Admin APIs independently verify signed administrator credentials and current database roles.</p></div></div><button className="secondary" onClick={onLogout}><LogOut size={15}/> Sign out</button></section>
+      <footer className="footer"><span>© 2026 Bingwa Sokoni Portal</span><span><i/> Secure administrator session</span></footer>
+    </div></main></div>;
 }
 function Metric({icon,label,value,note}:{icon:React.ReactNode;label:string;value:string;note:string}){return <div className="metric-card"><div className="metric-top"><span className="metric-icon">{icon}</span><span className="metric-dots">•••</span></div><span className="metric-label">{label}</span><strong>{value}</strong><small>{note}</small></div>}
 function DeviceRow({device}:{device:Device}){return <div className="device-row"><div className="device-icon"><Smartphone size={21}/></div><div className="device-info"><strong>{device.deviceName}</strong><span>{device.model||"Android device"} · {device.appVersion||"App version unknown"}</span></div><div className="device-state"><span className={`state-dot ${device.status==="ONLINE"?"online":""}`}/><span>{device.status==="ONLINE"?"Online":"Offline"}</span></div><div className="device-extra"><span>{device.automationEnabled?"Automation enabled":"Automation stopped"}</span><small>Last seen {time(device.lastSeenAt)}</small></div></div>}

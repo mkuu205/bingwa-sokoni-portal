@@ -7,7 +7,7 @@ import { z } from "zod";
 import { env } from "./env.js";
 import { prisma } from "./db.js";
 import { deviceSyncRouter } from "./device-sync.js";
-import { AuthRequest, hashPairingCode, issueUserToken, randomSecret, requireAdmin, requireAuth, sha256 } from "./security.js";
+import { AuthRequest, hashPairingCode, issueAdminToken, issueUserToken, randomSecret, requireAdmin, requireAuth, sha256 } from "./security.js";
 
 const app = express();
 app.disable("x-powered-by");
@@ -42,6 +42,15 @@ app.post("/api/auth/login", async (req, res) => {
   const user = await prisma.user.findUnique({ where: { phone } });
   if (!user || !(await bcrypt.compare(parsed.data.password, user.passwordHash))) return res.status(401).json({ error: "INVALID_CREDENTIALS" });
   return res.json({ user: { id: user.id, phone: user.phone, role: user.role, phoneVerified: Boolean(user.phoneVerifiedAt) }, token: issueUserToken(user) });
+});
+
+app.post("/api/auth/admin/login", async (req, res) => {
+  if (!env.ADMIN_PASSWORD_HASH) return res.status(503).json({ error: "ADMIN_LOGIN_NOT_CONFIGURED" });
+  const parsed = z.object({ username: z.string().min(1).max(80), password: z.string().min(1).max(128) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
+  const passwordMatches = await bcrypt.compare(parsed.data.password, env.ADMIN_PASSWORD_HASH);
+  if (parsed.data.username !== env.ADMIN_USERNAME || !passwordMatches) return res.status(401).json({ error: "INVALID_CREDENTIALS" });
+  return res.json({ user: { username: env.ADMIN_USERNAME, role: "ADMIN" }, token: issueAdminToken(env.ADMIN_USERNAME) });
 });
 
 app.get("/api/me", requireAuth, async (req: AuthRequest, res) => {
@@ -167,7 +176,7 @@ app.post("/api/devices/:id/commands", requireAuth, async (req: AuthRequest, res)
   }
 });
 
-app.get("/api/admin/overview", requireAuth, requireAdmin, async (_req, res) => {
+app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
   const [users, devices, pendingPayments, activeSubscriptions, queuedCommands] = await Promise.all([
     prisma.user.count(), prisma.device.count({ where: { revokedAt: null } }),
     prisma.payment.count({ where: { status: "PENDING" } }),

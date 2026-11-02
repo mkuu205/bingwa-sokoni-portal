@@ -10,7 +10,11 @@ services:
         value: production
       - key: DATABASE_URL
         sync: false
-      - key: JWT_SECRET
+      - key: JWT_ACCESS_SECRET
+        sync: false
+      - key: ADMIN_USERNAME
+        value: kish
+      - key: ADMIN_PASSWORD_HASH
         sync: false
       - key: PAIRING_CODE_PEPPER
         sync: false
