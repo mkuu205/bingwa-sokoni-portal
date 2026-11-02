@@ -1,3 +1,4 @@
+yaml
 name: Initialize Portal Database
 
 on:
@@ -18,7 +19,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
+          package-manager-cache: false
 
       - name: Install dependencies
         run: npm install --include=dev
