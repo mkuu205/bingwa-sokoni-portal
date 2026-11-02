@@ -1,0 +1,32 @@
+name: Initialize Portal Database
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  initialize:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install --include=dev
+
+      - name: Generate Prisma Client
+        run: npm run db:generate
+
+      - name: Synchronize database schema
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: npm exec -w apps/api -- prisma db push --schema=prisma/schema.prisma
