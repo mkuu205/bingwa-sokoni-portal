@@ -1,0 +1,285 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+  PENDING
+}
+enum DeviceStatus {
+  ONLINE
+  OFFLINE
+  REVOKED
+}
+enum CommandStatus {
+  QUEUED
+  DELIVERED
+  EXECUTING
+  COMPLETED
+  FAILED
+  EXPIRED
+  CANCELLED
+}
+enum TransactionStatus {
+  RECEIVED
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  UNKNOWN
+}
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  REVERSED
+}
+enum SignatureStatus {
+  PENDING
+  APPROVED
+  REVOKED
+}
+
+model User {
+  id               String   @id @default(cuid())
+  phone             String   @unique
+  passwordHash      String
+  role              Role     @default(USER)
+  phoneVerifiedAt   DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  devices           Device[]
+  subscriptions     Subscription[]
+  payments          Payment[]
+  tokenLedger       TokenLedgerEntry[]
+  pairingCodes      PairingCode[]
+  signatures        ApprovedSignature[]
+  auditEvents       AuditEvent[] @relation("ActorEvents")
+  dataPlans          PortalDataPlan[]
+}
+
+model Plan {
+  id                    String   @id @default(cuid())
+  code                  String   @unique
+  name                  String
+  priceKes              Int
+  durationDays          Int      @default(30)
+  maxDevices            Int?
+  transactionHistoryDays Int
+  active                Boolean  @default(true)
+  subscriptions         Subscription[]
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
+model Subscription {
+  id             String @id @default(cuid())
+  userId         String
+  planId         String
+  status         SubscriptionStatus @default(PENDING)
+  startsAt       DateTime?
+  expiresAt      DateTime?
+  paymentId      String? @unique
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  user           User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan           Plan @relation(fields: [planId], references: [id])
+  payment        Payment? @relation("SubscriptionPayment", fields: [paymentId], references: [id])
+  @@index([userId, status, expiresAt])
+}
+
+model Device {
+  id                String @id @default(cuid())
+  userId            String
+  deviceName        String
+  deviceKeyHash     String
+  status            DeviceStatus @default(OFFLINE)
+  appVersion        String?
+  model             String?
+  manufacturer      String?
+  androidVersion    String?
+  phoneNumber       String?
+  simSlot           Int?
+  carrierName       String?
+  automationEnabled Boolean @default(false)
+  executionState    String @default("IDLE")
+  lastSeenAt        DateTime?
+  lastHeartbeat     Json?
+  revokedAt         DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  commands          DeviceCommand[]
+  transactions      PortalTransaction[]
+  signatures        ApprovedSignature[]
+  @@index([userId, status])
+  dataPlans          PortalDataPlan[]
+}
+
+model PairingCode {
+  id         String @id @default(cuid())
+  userId     String
+  codeHash   String @unique
+  secretHash String?
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime @default(now())
+  user       User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([userId, expiresAt])
+}
+
+model DeviceCommand {
+  id             Int @id @default(autoincrement())
+  deviceId       String
+  commandType    String
+  payload        Json
+  status         CommandStatus @default(QUEUED)
+  expiresAt      DateTime
+  deliveredAt    DateTime?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  result          Json?
+  errorMessage   String?
+  idempotencyKey String? @unique
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  device         Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  @@index([deviceId, status, expiresAt])
+}
+
+model PortalTransaction {
+  id                   String @id @default(cuid())
+  deviceId             String
+  androidTransactionId String
+  executionId           String?
+  operationId           String?
+  customerName          String?
+  phoneNumber           String
+  packageName           String
+  amountKes             Decimal @db.Decimal(12, 2)
+  paymentMethod         String?
+  status                TransactionStatus @default(UNKNOWN)
+  verificationStatus    String?
+  verificationMessage   String?
+  receiptCode           String?
+  issue                 String?
+  executedAt            DateTime?
+  lastSyncedAt          DateTime @default(now())
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  device                Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  @@unique([deviceId, androidTransactionId])
+  @@index([deviceId, status, executedAt])
+  @@index([phoneNumber, createdAt])
+}
+
+model ApprovedSignature {
+  id             String @id @default(cuid())
+  userId         String
+  sourceDeviceId String
+  signatureKey   String
+  version        Int
+  status         SignatureStatus @default(APPROVED)
+  compatibleData Json?
+  signatureData  Json
+  approvedAt     DateTime @default(now())
+  revokedAt      DateTime?
+  createdAt      DateTime @default(now())
+  user           User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sourceDevice   Device @relation(fields: [sourceDeviceId], references: [id], onDelete: Cascade)
+  @@unique([userId, signatureKey, version])
+  @@index([userId, status])
+}
+
+model Payment {
+  id                 String @id @default(cuid())
+  userId             String
+  provider            String
+  providerReference   String? @unique
+  externalReference   String @unique
+  checkoutRequestId   String? @unique
+  purpose             String
+  amountKes           Int
+  status              PaymentStatus @default(PENDING)
+  providerPayload     Json?
+  verifiedAt          DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  user                User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscription        Subscription? @relation("SubscriptionPayment")
+  tokenLedgerEntries  TokenLedgerEntry[]
+  @@index([userId, status, createdAt])
+}
+
+model TokenLedgerEntry {
+  id          String @id @default(cuid())
+  userId      String
+  paymentId   String?
+  delta       Int
+  balanceAfter Int
+  reason      String
+  reference   String @unique
+  createdAt   DateTime @default(now())
+  user        User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  payment     Payment? @relation(fields: [paymentId], references: [id])
+  @@index([userId, createdAt])
+}
+
+model AuditEvent {
+  id         String @id @default(cuid())
+  actorId    String?
+  action     String
+  targetType String
+  targetId   String?
+  metadata   Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+  actor      User? @relation("ActorEvents", fields: [actorId], references: [id], onDelete: SetNull)
+  @@index([actorId, createdAt])
+  @@index([targetType, targetId, createdAt])
+}
+
+
+/// Phone-reported plan snapshot plus versioned desired portal configuration.
+model PortalDataPlan {
+  id                String   @id @default(cuid())
+  userId            String
+  deviceId          String
+  androidPlanId     String
+  packageName       String
+  description       String
+  ussdCode          String
+  ussdSteps         String?
+  priceKes          Decimal  @db.Decimal(12, 2)
+  validity          String
+  dataAmount        String
+  category          String
+  isActive          Boolean  @default(true)
+  commissionPerSale Decimal  @default(0) @db.Decimal(12, 2)
+  executeSim        Int      @default(-1)
+  ussdMode          String   @default("SIMPLE")
+  source            String   @default("SYSTEM")
+  deviceSnapshot    Json?
+  desiredConfig     Json?
+  version           Int      @default(1)
+  syncStatus        String   @default("SYNCED")
+  lastDeviceSyncAt  DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device            Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  @@unique([deviceId, androidPlanId])
+  @@index([userId, ussdMode, category])
+  @@index([userId, syncStatus])
+}
