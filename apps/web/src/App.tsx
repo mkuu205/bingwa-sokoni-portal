@@ -201,7 +201,6 @@ export default function App() {
       <label>Password</label><input type="password" value={loginPassword} onChange={e=>setLoginPassword(e.target.value)} placeholder="At least 10 characters" autoComplete={registering?"new-password":"current-password"} />
       <button className="primary full" onClick={auth}>{registering ? "Create account" : "Sign in"}</button>
       <button className="text-button full" onClick={()=>setRegistering(!registering)}>{registering ? "Already have an account? Sign in" : "New to Bingwa? Create an account"}</button>
-      {!registering&&<button className="text-button full" onClick={()=>navigate("/admin")}>Administrator sign in</button>}
       <div className="auth-foot"><ShieldCheck size={15}/> Secure account access · Phone verification setup required before production</div>
     </div>
   </div>;
