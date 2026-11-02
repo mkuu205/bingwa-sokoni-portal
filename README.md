@@ -11,7 +11,7 @@ The phone remains the USSD execution engine. The currently uploaded Android `Por
 Requirements: Node.js 20+, npm 10+, Docker Compose. Copy `.env.example` to `.env`, replace secrets, run `docker compose up -d db`, `npm install`, `npm run db:generate`, `npm run db:migrate`, `npm run db:seed`, then `npm run dev`. Web is at `http://localhost:5173`; API health at `http://localhost:4000/health`.
 
 ## Deployment
-Deploy API with managed PostgreSQL; deploy `apps/web` as a Vite static site. Set `VITE_API_BASE_URL` to API URL and API `WEB_ORIGIN` to `https://portal.bingwasokoni.top`; configure DNS with the frontend provider. Configure Android `PORTAL_API_BASE_URL` in a compatible app build.
+Deploy API with managed PostgreSQL; deploy `apps/web` as a Vite static site. The Render API start command runs `prisma migrate deploy` before launching the server, so committed migrations are applied before requests are served. Set `VITE_API_BASE_URL` to API URL and API `WEB_ORIGIN` to `https://portal.bingwasokoni.top`; configure DNS with the frontend provider. Configure Android `PORTAL_API_BASE_URL` in a compatible app build.
 
 ## Before production
 Configure phone OTP and password recovery, verified PayHero callbacks, backups, rate limiting, monitoring, security review, and Android desired-plan download/apply/acknowledge. Test pairing, revocation, offline/expired commands and version conflicts on a non-production phone. Do not enable remote financial or USSD commands before end-to-end device tests.

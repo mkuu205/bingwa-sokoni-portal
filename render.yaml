@@ -4,7 +4,7 @@ services:
     runtime: node
     rootDir: .
     buildCommand: npm install && npm run db:generate && npm run build
-    startCommand: npm run start -w apps/api
+    startCommand: npm run db:deploy && npm run start -w apps/api
     envVars:
       - key: NODE_ENV
         value: production
