@@ -22,7 +22,7 @@ app.use(/^\/api\/trpc\/deviceSync\.(pairDevice|heartbeat|pollCommands|reportComm
   const match = req.originalUrl.match(/deviceSync\.(pairDevice|heartbeat|pollCommands|reportCommand)/);
   if (!match) return res.status(404).json({ error: "PROCEDURE_NOT_FOUND" });
   req.url = `/${match[1]}`;
-  deviceSyncRouter.handle(req, res, next);
+  deviceSyncRouter(req, res, next);
 });
 
 app.post("/api/auth/register", async (req, res) => {
