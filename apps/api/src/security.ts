@@ -22,17 +22,25 @@ export function issueAdminToken(username: string) {
 export function verifyUserToken(token: string) {
   return jwt.verify(token, env.JWT_ACCESS_SECRET) as jwt.JwtPayload & { sub: string; role: string; typ: string };
 }
-export interface AuthRequest extends Request { auth?: { userId: string; role: string } }
-export function requireAuth(req: AuthRequest, res: Response, next: NextFunction) {
+export interface AuthRequest extends Request { auth?: { userId: string; role: string; tokenType: "user" | "admin" }; requestId?: string }
+export async function requireAuth(req: AuthRequest, res: Response, next: NextFunction) {
   const header = req.header("authorization");
   if (!header?.startsWith("Bearer ")) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  let payload: ReturnType<typeof verifyUserToken>;
   try {
-    const payload = verifyUserToken(header.slice(7));
-    if (payload.typ !== "user" || !payload.sub) return res.status(401).json({ error: "INVALID_TOKEN" });
-    req.auth = { userId: payload.sub, role: payload.role };
-    next();
+    payload = verifyUserToken(header.slice(7));
   } catch {
     return res.status(401).json({ error: "INVALID_TOKEN" });
+  }
+  if (payload.typ !== "user" || !payload.sub) return res.status(401).json({ error: "INVALID_TOKEN" });
+  try {
+    const user = await prisma.user.findUnique({ where: { id: payload.sub }, select: { id: true, role: true, suspendedAt: true } });
+    if (!user) return res.status(401).json({ error: "INVALID_TOKEN" });
+    if (user.suspendedAt) return res.status(403).json({ error: "ACCOUNT_SUSPENDED" });
+    req.auth = { userId: user.id, role: user.role, tokenType: "user" };
+    return next();
+  } catch (error) {
+    return next(error);
   }
 }
 export async function requireAdmin(req: AuthRequest, res: Response, next: NextFunction) {
@@ -50,16 +58,17 @@ export async function requireAdmin(req: AuthRequest, res: Response, next: NextFu
     if (payload.role !== "ADMIN" || payload.sub !== env.ADMIN_USERNAME || !env.ADMIN_PASSWORD_HASH) {
       return res.status(403).json({ error: "ADMIN_REQUIRED" });
     }
-    req.auth = { userId: payload.sub, role: "ADMIN" };
+    req.auth = { userId: payload.sub, role: "ADMIN", tokenType: "admin" };
     return next();
   }
 
   if (payload.typ !== "user" || !payload.sub) return res.status(401).json({ error: "INVALID_TOKEN" });
   if (payload.role !== "ADMIN") return res.status(403).json({ error: "ADMIN_REQUIRED" });
   try {
-    const user = await prisma.user.findUnique({ where: { id: payload.sub }, select: { role: true } });
+    const user = await prisma.user.findUnique({ where: { id: payload.sub }, select: { role: true, suspendedAt: true } });
     if (!user || user.role !== "ADMIN") return res.status(403).json({ error: "ADMIN_REQUIRED" });
-    req.auth = { userId: payload.sub, role: user.role };
+    if (user.suspendedAt) return res.status(403).json({ error: "ACCOUNT_SUSPENDED" });
+    req.auth = { userId: payload.sub, role: user.role, tokenType: "user" };
     return next();
   } catch (error) {
     return next(error);
