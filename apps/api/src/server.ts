@@ -1,5 +1,5 @@
 import express from "express";
-import { randomInt } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import cors from "cors";
 import helmet from "helmet";
 import bcrypt from "bcryptjs";
@@ -7,12 +7,18 @@ import { z } from "zod";
 import { env } from "./env.js";
 import { prisma } from "./db.js";
 import { deviceSyncRouter } from "./device-sync.js";
-import { AuthRequest, hashPairingCode, issueAdminToken, issueUserToken, randomSecret, requireAdmin, requireAuth, sha256 } from "./security.js";
+import { adminRouter } from "./admin.js";
+import { AuthRequest, hashPairingCode, issueAdminToken, issueUserToken, randomSecret, requireAuth, sha256 } from "./security.js";
 
 const app = express();
 app.disable("x-powered-by");
 app.use(helmet());
 app.use(cors({ origin: env.WEB_ORIGIN, credentials: false }));
+app.use((req: AuthRequest, res, next) => {
+  req.requestId = randomUUID();
+  res.setHeader("X-Request-ID", req.requestId);
+  next();
+});
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_req, res) => res.json({ ok: true, service: "bingwa-sokoni-portal-api" }));
@@ -41,6 +47,7 @@ app.post("/api/auth/login", async (req, res) => {
   const phone = parsed.data.phone.replace(/^\+/, "");
   const user = await prisma.user.findUnique({ where: { phone } });
   if (!user || !(await bcrypt.compare(parsed.data.password, user.passwordHash))) return res.status(401).json({ error: "INVALID_CREDENTIALS" });
+  if (user.suspendedAt) return res.status(403).json({ error: "ACCOUNT_SUSPENDED" });
   return res.json({ user: { id: user.id, phone: user.phone, role: user.role, phoneVerified: Boolean(user.phoneVerifiedAt) }, token: issueUserToken(user) });
 });
 
@@ -176,15 +183,7 @@ app.post("/api/devices/:id/commands", requireAuth, async (req: AuthRequest, res)
   }
 });
 
-app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
-  const [users, devices, pendingPayments, activeSubscriptions, queuedCommands] = await Promise.all([
-    prisma.user.count(), prisma.device.count({ where: { revokedAt: null } }),
-    prisma.payment.count({ where: { status: "PENDING" } }),
-    prisma.subscription.count({ where: { status: "ACTIVE", expiresAt: { gt: new Date() } } }),
-    prisma.deviceCommand.count({ where: { status: "QUEUED" } })
-  ]);
-  res.json({ users, devices, pendingPayments, activeSubscriptions, queuedCommands });
-});
+app.use("/api/admin", adminRouter);
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error("Unhandled API error", err instanceof Error ? err.message : "unknown");

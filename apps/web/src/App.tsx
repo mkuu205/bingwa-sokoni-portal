@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { Activity, ArrowDownLeft, ArrowUpRight, Bell, CheckCircle2, ChevronDown, CircleHelp, Command, CreditCard, Database, LayoutDashboard, LogOut, Menu, MonitorSmartphone, Plus, RefreshCw, Search, Settings, ShieldCheck, Smartphone, Users, Wallet, Wifi, X } from "lucide-react";
 import { ApiError, api } from "./api";
 import { resolveRoute } from "./route-state.js";
+import AdminPanel from "./AdminPanel";
 
 type Device = { id: string; deviceName: string; status: string; lastSeenAt?: string | null; appVersion?: string | null; model?: string | null; automationEnabled: boolean; executionState: string };
 type Me = { id: string; phone: string; role: string; tokenBalance: number; devices: Device[]; subscriptions: any[] };
@@ -179,7 +180,7 @@ export default function App() {
   if (!authReady) return <div className="auth-shell"><div className="auth-card"><div className="brand-mark">B</div><p className="muted">Restoring your secure session…</p></div></div>;
 
   if (route.view === "admin-dashboard") return adminOverview
-    ? <AdminDashboard overview={adminOverview} username={adminSession?.username || me?.phone || "Administrator"} onLogout={logout} />
+    ? <AdminPanel username={adminSession?.username || me?.phone || "Administrator"} onLogout={logout} />
     : <div className="auth-shell"><div className="auth-card"><h1>Admin dashboard unavailable</h1><p className="muted">{error || "The overview could not be loaded."}</p><button className="primary full" onClick={()=>void refresh()}>Retry</button><button className="text-button full" onClick={logout}>Sign out</button></div></div>;
 
   if (route.view === "admin-login") return <AdminLogin username={adminUsername} password={adminPassword} error={error} onUsername={setAdminUsername} onPassword={setAdminPassword} onSubmit={adminAuth} onCustomerLogin={() => { setError(""); navigate("/login"); }} />;
@@ -274,14 +275,6 @@ function AdminLogin({username,password,error,onUsername,onPassword,onSubmit,onCu
     <button className="text-button full" type="button" onClick={onCustomerLogin}>Customer sign in</button>
     <div className="auth-foot"><ShieldCheck size={15}/> Administrator access is checked by the API.</div>
   </form></div>;
-}
-function AdminDashboard({overview,username,onLogout}:{overview:AdminOverview;username:string;onLogout:()=>void}){
-  return <div className="app-shell"><main className="main"><header className="topbar"><div className="breadcrumbs">Bingwa Sokoni <span>/</span> <strong>Administration</strong></div><div className="top-actions"><span>{username}</span><button className="secondary" onClick={onLogout}><LogOut size={15}/> Sign out</button></div></header>
-    <div className="content"><div className="page-heading"><div><div className="eyebrow">SECURE ADMINISTRATION</div><h1>Admin dashboard</h1><p className="muted">Server-authorized overview of portal activity.</p></div></div>
-      <div className="metric-grid"><Metric icon={<Users/>} label="Users" value={String(overview.users)} note="Registered accounts"/><Metric icon={<Smartphone/>} label="Devices" value={String(overview.devices)} note="Non-revoked devices"/><Metric icon={<CreditCard/>} label="Pending payments" value={String(overview.pendingPayments)} note="Awaiting verification"/><Metric icon={<Activity/>} label="Active subscriptions" value={String(overview.activeSubscriptions)} note="Currently active"/><Metric icon={<Command/>} label="Queued commands" value={String(overview.queuedCommands)} note="Waiting for device delivery"/></div>
-      <section className="panel"><div className="panel-heading"><div><h3>Administrator access</h3><p>Admin APIs independently verify signed administrator credentials and current database roles.</p></div></div><button className="secondary" onClick={onLogout}><LogOut size={15}/> Sign out</button></section>
-      <footer className="footer"><span>© 2026 Bingwa Sokoni Portal</span><span><i/> Secure administrator session</span></footer>
-    </div></main></div>;
 }
 function Metric({icon,label,value,note}:{icon:React.ReactNode;label:string;value:string;note:string}){return <div className="metric-card"><div className="metric-top"><span className="metric-icon">{icon}</span><span className="metric-dots">•••</span></div><span className="metric-label">{label}</span><strong>{value}</strong><small>{note}</small></div>}
 function DeviceRow({device}:{device:Device}){return <div className="device-row"><div className="device-icon"><Smartphone size={21}/></div><div className="device-info"><strong>{device.deviceName}</strong><span>{device.model||"Android device"} · {device.appVersion||"App version unknown"}</span></div><div className="device-state"><span className={`state-dot ${device.status==="ONLINE"?"online":""}`}/><span>{device.status==="ONLINE"?"Online":"Offline"}</span></div><div className="device-extra"><span>{device.automationEnabled?"Automation enabled":"Automation stopped"}</span><small>Last seen {time(device.lastSeenAt)}</small></div></div>}

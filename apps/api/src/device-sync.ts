@@ -17,8 +17,8 @@ function response(res: any, data: unknown) {
 }
 async function authDevice(input: any) {
   if (!input?.deviceId || !input?.deviceToken) return null;
-  const device = await prisma.device.findUnique({ where: { id: String(input.deviceId) } });
-  if (!device || device.revokedAt || device.status === "REVOKED") return null;
+  const device = await prisma.device.findUnique({ where: { id: String(input.deviceId) }, include: { user: { select: { suspendedAt: true } } } });
+  if (!device || device.revokedAt || device.status === "REVOKED" || device.user.suspendedAt) return null;
   if (device.deviceKeyHash !== sha256(String(input.deviceToken))) return null;
   return device;
 }
@@ -42,7 +42,7 @@ deviceSyncRouter.post("/pairDevice", async (req, res) => {
 
   const codeHash = hashPairingCode(parsed.data.code.trim().toUpperCase());
   const pairing = await prisma.pairingCode.findUnique({ where: { codeHash }, include: { user: { include: { subscriptions: { include: { plan: true } } } } } });
-  if (!pairing || pairing.consumedAt || pairing.expiresAt <= new Date()) {
+  if (!pairing || pairing.consumedAt || pairing.expiresAt <= new Date() || pairing.user.suspendedAt) {
     return response(res, { accepted: false, reason: "PAIRING_CODE_INVALID_OR_EXPIRED" });
   }
   const activeSub = pairing.user.subscriptions.find(s => s.status === "ACTIVE" && s.expiresAt && s.expiresAt > new Date());

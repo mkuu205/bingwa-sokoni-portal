@@ -57,6 +57,8 @@ model User {
   passwordHash      String
   role              Role     @default(USER)
   phoneVerifiedAt   DateTime?
+  suspendedAt       DateTime?
+  suspensionReason  String?
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
   devices           Device[]
@@ -243,6 +245,9 @@ model AuditEvent {
   targetType String
   targetId   String?
   metadata   Json?
+  actorLabel String?
+  requestId  String?
+  idempotencyKey String?
   ipAddress  String?
   createdAt  DateTime @default(now())
   actor      User? @relation("ActorEvents", fields: [actorId], references: [id], onDelete: SetNull)
