@@ -143,7 +143,7 @@ export default function App() {
         setMe(profile);
         if (["Subscription", "Buy Tokens", "Token History"].includes(page)) setBillingPayments(await api<BillingPayment[]>("/api/billing/payments"));
       } catch { /* Session refresh remains available through the header button. */ }
-    }, page === "Subscription" ? 15000 : 45000);
+    }, ["Overview", "Subscription"].includes(page) ? 15000 : 45000);
     return () => window.clearInterval(timer);
   }, [me?.id, page]);
 
