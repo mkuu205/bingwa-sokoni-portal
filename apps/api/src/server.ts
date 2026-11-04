@@ -9,6 +9,8 @@ import { prisma } from "./db.js";
 import { deviceSyncRouter } from "./device-sync.js";
 import { adminRouter } from "./admin.js";
 import { AuthRequest, hashPairingCode, issueAdminToken, issueUserToken, randomSecret, requireAuth, sha256 } from "./security.js";
+import { loginRequirement } from "./auth-policy.js";
+import { verifiedSubscriptionDuration } from "./billing-logic.js";
 
 const app = express();
 app.disable("x-powered-by");
@@ -38,7 +40,7 @@ app.post("/api/auth/register", async (req, res) => {
   if (!phone) return res.status(400).json({ error: "INVALID_PHONE" });
   if (await prisma.user.findUnique({ where: { phone } })) return res.status(409).json({ error: "PHONE_ALREADY_REGISTERED" });
   const user = await prisma.user.create({ data: { phone, passwordHash: await bcrypt.hash(parsed.data.password, 12) } });
-  try { await createAndSendOtp(phone, user.id, "LOGIN"); }
+  try { await createAndSendOtp(phone, user.id, "REGISTRATION"); }
   catch (e: any) {
     await prisma.user.delete({ where: { id: user.id } });
     return res.status(503).json({ error: e?.message === "TALKSASA_NOT_CONFIGURED" ? "OTP_PROVIDER_NOT_CONFIGURED" : "OTP_DELIVERY_FAILED" });
@@ -56,11 +58,13 @@ function normalizeAuthPhone(value: string): string | null {
 function otpDigest(code: string, phone: string, purpose: string) {
   return sha256(`${env.OTP_HASH_SECRET || env.PAIRING_CODE_PEPPER}:${phone}:${purpose}:${code}`);
 }
-async function sendTalkSasaOtp(phone: string, code: string, purpose: "LOGIN" | "PASSWORD_RESET") {
+async function sendTalkSasaOtp(phone: string, code: string, purpose: "LOGIN" | "PASSWORD_RESET" | "REGISTRATION" | "PHONE_CHANGE") {
   if (!env.TALKSASA_API_KEY || !env.TALKSASA_SENDER_ID) throw new Error("TALKSASA_NOT_CONFIGURED");
-  const message = purpose === "LOGIN"
-    ? `Bingwa Sokoni login code: ${code}. Expires in 5 minutes. Do not share this code.`
-    : `Bingwa Sokoni password reset code: ${code}. Expires in 5 minutes. Do not share this code.`;
+  const message = purpose === "PASSWORD_RESET"
+    ? `Bingwa Sokoni password reset code: ${code}. Expires in 5 minutes. Do not share this code.`
+    : purpose === "PHONE_CHANGE"
+      ? `Bingwa Sokoni phone-change verification code: ${code}. Expires in 5 minutes. Do not share this code.`
+      : `Bingwa Sokoni phone verification code: ${code}. Expires in 5 minutes. Do not share this code.`;
   const base = env.TALKSASA_API_URL.endsWith("/") ? env.TALKSASA_API_URL : `${env.TALKSASA_API_URL}/`;
   const response = await fetch(new URL("sms/send", base), {
     method: "POST",
@@ -72,11 +76,14 @@ async function sendTalkSasaOtp(phone: string, code: string, purpose: "LOGIN" | "
     throw new Error(`TALKSASA_SEND_FAILED_${response.status}`);
   }
 }
-async function createAndSendOtp(phone: string, userId: string | null, purpose: "LOGIN" | "PASSWORD_RESET") {
-  const recent = await prisma.otpChallenge.findFirst({ where: { phone, purpose, createdAt: { gt: new Date(Date.now() - 60_000) } }, orderBy: { createdAt: "desc" } });
-  if (recent) throw new Error("OTP_COOLDOWN");
+async function createAndSendOtp(phone: string, userId: string | null, purpose: "LOGIN" | "PASSWORD_RESET" | "REGISTRATION" | "PHONE_CHANGE") {
   const code = String(randomInt(100000, 1000000));
-  const challenge = await prisma.otpChallenge.create({ data: { phone, userId, purpose, codeHash: otpDigest(code, phone, purpose), expiresAt: new Date(Date.now() + 5 * 60_000) } });
+  const challenge = await prisma.$transaction(async tx => {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${phone}), hashtext(${purpose}))`;
+    const recent = await tx.otpChallenge.findFirst({ where: { phone, purpose, createdAt: { gt: new Date(Date.now() - 60_000) } }, orderBy: { createdAt: "desc" } });
+    if (recent) throw new Error("OTP_COOLDOWN");
+    return tx.otpChallenge.create({ data: { phone, userId, purpose, codeHash: otpDigest(code, phone, purpose), expiresAt: new Date(Date.now() + 5 * 60_000) } });
+  });
   try { await sendTalkSasaOtp(phone, code, purpose); }
   catch (error) { await prisma.otpChallenge.delete({ where: { id: challenge.id } }); throw error; }
 }
@@ -87,29 +94,42 @@ app.post("/api/auth/login", async (req, res) => {
   if (!phone) return res.status(400).json({ error: "INVALID_PHONE" });
   const user = await prisma.user.findUnique({ where: { phone } });
   if (!user || !(await bcrypt.compare(parsed.data.password, user.passwordHash))) return res.status(401).json({ error: "INVALID_CREDENTIALS" });
-  if (user.suspendedAt) return res.status(403).json({ error: "ACCOUNT_SUSPENDED" });
-  try { await createAndSendOtp(phone, user.id, "LOGIN"); }
-  catch (e: any) {
-    if (e?.message === "OTP_COOLDOWN") return res.status(429).json({ error: "OTP_COOLDOWN", message: "Please wait before requesting another code." });
-    return res.status(503).json({ error: e?.message === "TALKSASA_NOT_CONFIGURED" ? "OTP_PROVIDER_NOT_CONFIGURED" : "OTP_DELIVERY_FAILED" });
+  const requirement = loginRequirement(user);
+  if (requirement === "ACCOUNT_SUSPENDED") return res.status(403).json({ error: "ACCOUNT_SUSPENDED" });
+  if (requirement === "REGISTRATION_OTP") {
+    try { await createAndSendOtp(phone, user.id, "REGISTRATION"); }
+    catch (e: any) {
+      if (e?.message === "OTP_COOLDOWN") return res.status(429).json({ error: "OTP_COOLDOWN", message: "Please wait before requesting another code." });
+      return res.status(503).json({ error: e?.message === "TALKSASA_NOT_CONFIGURED" ? "OTP_PROVIDER_NOT_CONFIGURED" : "OTP_DELIVERY_FAILED" });
+    }
+    return res.json({ requiresOtp: true, flow: "registration", phone: `${phone.slice(0, 5)}••••${phone.slice(-2)}`, message: "Verify your phone number to finish creating your account." });
   }
-  return res.json({ requiresOtp: true, phone: `${phone.slice(0, 5)}••••${phone.slice(-2)}`, message: "A verification code has been sent." });
+  return res.json({ user: { id: user.id, phone: user.phone, role: user.role, phoneVerified: true }, token: issueUserToken(user) });
 });
-app.post("/api/auth/login/verify", async (req, res) => {
+app.post("/api/auth/register/verify", async (req, res) => {
   const parsed = z.object({ phone: z.string().min(9).max(16), code: z.string().regex(/^\d{6}$/) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
   const phone = normalizeAuthPhone(parsed.data.phone);
   if (!phone) return res.status(400).json({ error: "INVALID_PHONE" });
-  const challenge = await prisma.otpChallenge.findFirst({ where: { phone, purpose: "LOGIN", consumedAt: null, expiresAt: { gt: new Date() } }, orderBy: { createdAt: "desc" } });
+  const challenge = await prisma.otpChallenge.findFirst({ where: { phone, purpose: "REGISTRATION", consumedAt: null, expiresAt: { gt: new Date() } }, orderBy: { createdAt: "desc" } });
   if (!challenge || challenge.attempts >= 5) return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
-  if (challenge.codeHash !== otpDigest(parsed.data.code, phone, "LOGIN")) {
-    await prisma.otpChallenge.update({ where: { id: challenge.id }, data: { attempts: { increment: 1 } } });
-    return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
-  }
-  const user = await prisma.user.findUnique({ where: { id: challenge.userId || "" } });
-  if (!user || user.suspendedAt) return res.status(403).json({ error: "ACCOUNT_UNAVAILABLE" });
-  await prisma.$transaction([prisma.otpChallenge.update({ where: { id: challenge.id }, data: { consumedAt: new Date() } }), prisma.user.update({ where: { id: user.id }, data: { phoneVerifiedAt: user.phoneVerifiedAt ?? new Date() } })]);
-  return res.json({ user: { id: user.id, phone: user.phone, role: user.role, phoneVerified: true }, token: issueUserToken(user) });
+  if (!challenge.userId) return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
+  const result = await prisma.$transaction(async tx => {
+    await tx.$queryRaw`SELECT "id" FROM "OtpChallenge" WHERE "id" = ${challenge.id} FOR UPDATE`;
+    const current = await tx.otpChallenge.findUnique({ where: { id: challenge.id } });
+    if (!current || current.consumedAt || current.expiresAt <= new Date() || current.attempts >= 5) return null;
+    if (current.codeHash !== otpDigest(parsed.data.code, phone, "REGISTRATION")) {
+      await tx.otpChallenge.update({ where: { id: current.id }, data: { attempts: { increment: 1 } } });
+      return null;
+    }
+    const user = await tx.user.findUnique({ where: { id: current.userId! } });
+    if (!user || user.phone !== phone || user.suspendedAt) return null;
+    const now = new Date();
+    await tx.otpChallenge.update({ where: { id: current.id }, data: { consumedAt: now } });
+    return tx.user.update({ where: { id: user.id }, data: { phoneVerifiedAt: user.phoneVerifiedAt ?? now } });
+  });
+  if (!result) return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
+  return res.json({ user: { id: result.id, phone: result.phone, role: result.role, phoneVerified: true }, token: issueUserToken(result) });
 });
 app.post("/api/auth/password/forgot", async (req, res) => {
   const parsed = z.object({ phone: z.string().min(9).max(16) }).safeParse(req.body);
@@ -142,6 +162,48 @@ app.post("/api/auth/password/reset", async (req, res) => {
   return res.json({ ok: true, message: "Password reset successfully. Please sign in again." });
 });
 
+app.post("/api/account/phone/change/request", requireAuth, async (req: AuthRequest, res) => {
+  const parsed = z.object({ phone: z.string().min(9).max(16) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
+  const phone = normalizeAuthPhone(parsed.data.phone);
+  if (!phone) return res.status(400).json({ error: "INVALID_PHONE" });
+  if (phone === (await prisma.user.findUnique({ where: { id: req.auth!.userId }, select: { phone: true } }))?.phone) {
+    return res.status(400).json({ error: "PHONE_UNCHANGED" });
+  }
+  if (await prisma.user.findUnique({ where: { phone }, select: { id: true } })) return res.status(409).json({ error: "PHONE_ALREADY_REGISTERED" });
+  try {
+    await createAndSendOtp(phone, req.auth!.userId, "PHONE_CHANGE");
+    return res.json({ ok: true, message: "A verification code was sent to the new phone number." });
+  } catch (error: any) {
+    if (error?.message === "OTP_COOLDOWN") return res.status(429).json({ error: "OTP_COOLDOWN", message: "Please wait before requesting another code." });
+    return res.status(503).json({ error: error?.message === "TALKSASA_NOT_CONFIGURED" ? "OTP_PROVIDER_NOT_CONFIGURED" : "OTP_DELIVERY_FAILED" });
+  }
+});
+
+app.post("/api/account/phone/change/verify", requireAuth, async (req: AuthRequest, res) => {
+  const parsed = z.object({ phone: z.string().min(9).max(16), code: z.string().regex(/^\d{6}$/) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
+  const phone = normalizeAuthPhone(parsed.data.phone);
+  if (!phone) return res.status(400).json({ error: "INVALID_PHONE" });
+  const challenge = await prisma.otpChallenge.findFirst({ where: { phone, userId: req.auth!.userId, purpose: "PHONE_CHANGE", consumedAt: null, expiresAt: { gt: new Date() } }, orderBy: { createdAt: "desc" } });
+  if (!challenge || challenge.attempts >= 5) return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
+  const updated = await prisma.$transaction(async tx => {
+    await tx.$queryRaw`SELECT "id" FROM "OtpChallenge" WHERE "id" = ${challenge.id} FOR UPDATE`;
+    const current = await tx.otpChallenge.findUnique({ where: { id: challenge.id } });
+    if (!current || current.consumedAt || current.expiresAt <= new Date() || current.attempts >= 5 || current.userId !== req.auth!.userId) return null;
+    if (current.codeHash !== otpDigest(parsed.data.code, phone, "PHONE_CHANGE")) {
+      await tx.otpChallenge.update({ where: { id: current.id }, data: { attempts: { increment: 1 } } });
+      return null;
+    }
+    if (await tx.user.findUnique({ where: { phone }, select: { id: true } })) return null;
+    const user = await tx.user.update({ where: { id: req.auth!.userId }, data: { phone, phoneVerifiedAt: new Date() }, select: { id: true, phone: true, role: true, phoneVerifiedAt: true } });
+    await tx.otpChallenge.update({ where: { id: current.id }, data: { consumedAt: new Date() } });
+    return user;
+  });
+  if (!updated) return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
+  return res.json({ ...updated, phoneVerified: true });
+});
+
 app.post("/api/auth/admin/login", async (req, res) => {
   if (!env.ADMIN_PASSWORD_HASH) return res.status(503).json({ error: "ADMIN_LOGIN_NOT_CONFIGURED" });
   const parsed = z.object({ username: z.string().min(1).max(80), password: z.string().min(1).max(128) }).safeParse(req.body);
@@ -156,11 +218,19 @@ app.get("/api/me", requireAuth, async (req: AuthRequest, res) => {
     where: { id: req.auth!.userId },
     select: { id: true, phone: true, role: true, phoneVerifiedAt: true, createdAt: true,
       devices: { where: { revokedAt: null }, orderBy: { createdAt: "desc" }, select: { id: true, deviceName: true, status: true, lastSeenAt: true, appVersion: true, model: true, automationEnabled: true, executionState: true } },
-      subscriptions: { include: { plan: true }, orderBy: { createdAt: "desc" }, take: 5 }
+      subscriptions: { include: { plan: true }, orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }], take: 20 }
     }
   });
-  const ledger = await prisma.tokenLedgerEntry.findMany({ where: { userId: req.auth!.userId }, orderBy: { createdAt: "desc" }, take: 1 });
-  return res.json({ ...user, tokenBalance: ledger[0]?.balanceAfter ?? 0 });
+  if (!user) return res.status(404).json({ error: "USER_NOT_FOUND" });
+  const now = new Date();
+  const [activeSubscription, latestSubscription, ledger] = await Promise.all([
+    prisma.subscription.findFirst({ where: { userId: user.id, status: "ACTIVE", expiresAt: { gt: now } }, include: { plan: true }, orderBy: [{ expiresAt: "desc" }, { id: "desc" }] }),
+    prisma.subscription.findFirst({ where: { userId: user.id }, include: { plan: true }, orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }, { id: "desc" }] }),
+    prisma.tokenLedgerEntry.findFirst({ where: { userId: user.id }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] })
+  ]);
+  const selected = activeSubscription ?? latestSubscription;
+  const subscription = selected ? { ...selected, status: selected.status === "ACTIVE" && selected.expiresAt && selected.expiresAt <= now ? "EXPIRED" : selected.status } : null;
+  return res.json({ ...user, subscription, tokenBalance: ledger?.balanceAfter ?? 0 });
 });
 
 app.get("/api/plans", async (_req, res) => {
@@ -317,21 +387,38 @@ async function payHeroRequest(path: string, init: RequestInit = {}) {
   }
   return data;
 }
-async function initiatePayHeroPayment(userId: string, phoneInput: string, amountKes: number, purpose: string, details: Record<string, unknown>) {
+async function initiatePayHeroPayment(userId: string, phoneInput: string, amountKes: number, purpose: string, details: Record<string, unknown>, requestIdempotencyKey: string) {
   if (!env.PAYHERO_CALLBACK_URL) throw new Error("PAYHERO_CALLBACK_URL_NOT_CONFIGURED");
   const phone = normalizeKenyanPhone(phoneInput);
   if (!phone) throw new Error("INVALID_KENYAN_PHONE");
-  const externalReference = `BSP-${randomUUID()}`;
-  const payment = await prisma.payment.create({
-    data: { userId, provider: "PAYHERO", externalReference, purpose, amountKes, status: "PENDING",
-      providerPayload: { phone, details } as any }
+  const sameRequest = (payment: any) => {
+    const payload = payment.providerPayload && typeof payment.providerPayload === "object" ? payment.providerPayload as any : {};
+    return payment.userId === userId && payment.purpose === purpose && payment.amountKes === amountKes && payload.phone === phone && JSON.stringify(payload.details ?? {}) === JSON.stringify(details);
+  };
+  const created = await prisma.$transaction(async tx => {
+    await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${userId} FOR UPDATE`;
+    const prior = await tx.payment.findUnique({ where: { requestIdempotencyKey } });
+    if (prior) {
+      if (!sameRequest(prior)) throw new Error("PAYMENT_IDEMPOTENCY_KEY_CONFLICT");
+      return { payment: prior, isNew: false };
+    }
+    const recentPending = await tx.payment.findFirst({ where: { userId, purpose, status: "PENDING", createdAt: { gt: new Date(Date.now() - 15 * 60_000) } }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] });
+    if (recentPending && sameRequest(recentPending)) return { payment: recentPending, isNew: false };
+    const externalReference = `BSP-${randomUUID()}`;
+    const payment = await tx.payment.create({
+      data: { userId, provider: "PAYHERO", externalReference, requestIdempotencyKey, purpose, amountKes, status: "PENDING",
+        providerPayload: { phone, details } as any }
+    });
+    return { payment, isNew: true };
   });
+  const { payment } = created;
+  if (!created.isNew) return { paymentId: payment.id, externalReference: payment.externalReference, status: payment.status, providerStatus: "EXISTING" };
   try {
     const result: any = await payHeroRequest("/payments", {
       method: "POST",
       body: JSON.stringify({
         amount: amountKes, phone_number: phone, channel_id: env.PAYHERO_CHANNEL_ID,
-        provider: "m-pesa", external_reference: externalReference, callback_url: env.PAYHERO_CALLBACK_URL
+        provider: "m-pesa", external_reference: payment.externalReference, callback_url: env.PAYHERO_CALLBACK_URL
       })
     });
     const providerReference = typeof result.reference === "string" ? result.reference : null;
@@ -340,7 +427,7 @@ async function initiatePayHeroPayment(userId: string, phoneInput: string, amount
       where: { id: payment.id },
       data: { providerReference, checkoutRequestId, providerPayload: { phone, details, initiation: result } as any }
     });
-    return { paymentId: payment.id, externalReference, status: "PENDING", providerStatus: String(result.status ?? "QUEUED") };
+    return { paymentId: payment.id, externalReference: payment.externalReference, status: "PENDING", providerStatus: String(result.status ?? "QUEUED") };
   } catch (error) {
     await prisma.payment.update({ where: { id: payment.id }, data: { status: "FAILED", providerPayload: { phone, details, initiationError: error instanceof Error ? error.message : "unknown" } as any } });
     throw error;
@@ -371,15 +458,22 @@ async function verifyAndApplyPayHeroPayment(externalReference: string, callbackA
     if (changed.count === 0) return false;
 
     if (payment.purpose.startsWith("SUBSCRIPTION:")) {
-      const planId = payment.purpose.slice("SUBSCRIPTION:".length);
+      await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${payment.userId} FOR UPDATE`;
+      const planId = typeof details.planId === "string" ? details.planId : payment.purpose.slice("SUBSCRIPTION:".length);
       const plan = await tx.plan.findUnique({ where: { id: planId } });
-      if (!plan || !plan.active || plan.priceKes !== payment.amountKes) throw new Error("SUBSCRIPTION_PLAN_VALIDATION_FAILED");
+      const durationDays = verifiedSubscriptionDuration(plan, payment.purpose.slice("SUBSCRIPTION:".length), details, payment.amountKes);
+      if (!plan) throw new Error("SUBSCRIPTION_PLAN_VALIDATION_FAILED");
       const now = new Date();
-      const current = await tx.subscription.findFirst({ where: { userId: payment.userId, status: "ACTIVE", expiresAt: { gt: now } }, orderBy: { expiresAt: "desc" } });
-      const startsAt = now;
-      const base = current?.expiresAt && current.expiresAt > now ? current.expiresAt : now;
-      const expiresAt = new Date(base.getTime() + plan.durationDays * 86400000);
-      await tx.subscription.create({ data: { userId: payment.userId, planId: plan.id, paymentId: payment.id, status: "ACTIVE", startsAt, expiresAt } });
+      const activeSubscription = await tx.subscription.findFirst({ where: { userId: payment.userId, status: "ACTIVE", expiresAt: { gt: now } }, orderBy: [{ expiresAt: "desc" }, { id: "desc" }] });
+      const current = activeSubscription ?? await tx.subscription.findFirst({ where: { userId: payment.userId }, orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }, { id: "desc" }] });
+      const startsAt = activeSubscription?.startsAt ?? now;
+      const base = activeSubscription?.expiresAt && activeSubscription.expiresAt > now ? activeSubscription.expiresAt : now;
+      const expiresAt = new Date(base.getTime() + durationDays * 86400000);
+      if (current) {
+        await tx.subscription.update({ where: { id: current.id }, data: { planId: plan.id, paymentId: payment.id, status: "ACTIVE", startsAt, expiresAt } });
+      } else {
+        await tx.subscription.create({ data: { userId: payment.userId, planId: plan.id, paymentId: payment.id, status: "ACTIVE", startsAt, expiresAt } });
+      }
     } else if (payment.purpose.startsWith("TOKENS:")) {
       const packCode = payment.purpose.slice("TOKENS:".length);
       const pack = tokenPackages().find(p => p.code === packCode);
@@ -401,30 +495,30 @@ app.get("/api/billing/token-packages", requireAuth, (_req, res) => {
   res.json(tokenPackages().map(({ code, name, amountKes, tokens }) => ({ code, name, amountKes, tokens })));
 });
 app.post("/api/billing/subscriptions", requireAuth, async (req: AuthRequest, res) => {
-  const parsed = z.object({ planId: z.string().min(1), phoneNumber: z.string().min(9).max(20) }).safeParse(req.body);
+  const parsed = z.object({ planId: z.string().min(1), phoneNumber: z.string().min(9).max(20), idempotencyKey: z.string().trim().min(8).max(120).optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
   const plan = await prisma.plan.findUnique({ where: { id: parsed.data.planId } });
   if (!plan || !plan.active) return res.status(404).json({ error: "PLAN_NOT_AVAILABLE" });
   try {
-    const result = await initiatePayHeroPayment(req.auth!.userId, parsed.data.phoneNumber, plan.priceKes, `SUBSCRIPTION:${plan.id}`, { planId: plan.id, planName: plan.name });
+    const result = await initiatePayHeroPayment(req.auth!.userId, parsed.data.phoneNumber, plan.priceKes, `SUBSCRIPTION:${plan.id}`, { planId: plan.id, planName: plan.name, priceKes: plan.priceKes, durationDays: plan.durationDays }, parsed.data.idempotencyKey ?? randomUUID());
     return res.status(201).json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : "PAYMENT_INITIATION_FAILED";
-    const status = message === "INVALID_KENYAN_PHONE" ? 400 : message.includes("NOT_CONFIGURED") ? 503 : 502;
+    const status = message === "INVALID_KENYAN_PHONE" ? 400 : message === "PAYMENT_IDEMPOTENCY_KEY_CONFLICT" ? 409 : message.includes("NOT_CONFIGURED") ? 503 : 502;
     return res.status(status).json({ error: message });
   }
 });
 app.post("/api/billing/tokens", requireAuth, async (req: AuthRequest, res) => {
-  const parsed = z.object({ packageCode: z.string().min(2).max(60), phoneNumber: z.string().min(9).max(20) }).safeParse(req.body);
+  const parsed = z.object({ packageCode: z.string().min(2).max(60), phoneNumber: z.string().min(9).max(20), idempotencyKey: z.string().trim().min(8).max(120).optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
   const pack = tokenPackages().find(p => p.code === parsed.data.packageCode);
   if (!pack) return res.status(404).json({ error: "TOKEN_PACKAGE_NOT_AVAILABLE" });
   try {
-    const result = await initiatePayHeroPayment(req.auth!.userId, parsed.data.phoneNumber, pack.amountKes, `TOKENS:${pack.code}`, { packageCode: pack.code, tokens: pack.tokens });
+    const result = await initiatePayHeroPayment(req.auth!.userId, parsed.data.phoneNumber, pack.amountKes, `TOKENS:${pack.code}`, { packageCode: pack.code, tokens: pack.tokens }, parsed.data.idempotencyKey ?? randomUUID());
     return res.status(201).json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : "PAYMENT_INITIATION_FAILED";
-    const status = message === "INVALID_KENYAN_PHONE" ? 400 : message.includes("NOT_CONFIGURED") ? 503 : 502;
+    const status = message === "INVALID_KENYAN_PHONE" ? 400 : message === "PAYMENT_IDEMPOTENCY_KEY_CONFLICT" ? 409 : message.includes("NOT_CONFIGURED") ? 503 : 502;
     return res.status(status).json({ error: message });
   }
 });

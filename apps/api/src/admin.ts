@@ -3,6 +3,7 @@ import { z } from "zod";
 import { prisma } from "./db.js";
 import { env } from "./env.js";
 import { AuthRequest, requireAdmin } from "./security.js";
+import { transitionSubscription } from "./subscription-lifecycle.js";
 
 export const adminRouter = Router();
 adminRouter.use(requireAdmin);
@@ -24,7 +25,7 @@ async function audit(tx: any, req: AuthRequest, data: { action: string; targetTy
 }
 function safeMetadata(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const allowed = new Set(["reason", "days", "direction", "amount", "delta", "balanceAfter", "expiresAt", "previousExpiresAt", "planId", "name", "code", "priceKes", "durationDays", "maxDevices", "transactionHistoryDays", "active", "suspended", "version", "status"]);
+  const allowed = new Set(["reason", "days", "direction", "amount", "delta", "balanceAfter", "expiresAt", "previousExpiresAt", "startsAt", "previousStartsAt", "planId", "requestedPlanId", "previousPlanId", "planName", "name", "code", "priceKes", "durationDays", "requestedDurationDays", "maxDevices", "transactionHistoryDays", "active", "suspended", "version", "status", "previousStatus", "action", "userId"]);
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
     if (!allowed.has(key)) continue;
@@ -143,6 +144,110 @@ adminRouter.get("/subscriptions/:id", async (req, res) => {
   const auditRows = await prisma.auditEvent.findMany({ where: { targetType: "Subscription", targetId: item.id }, orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 100, select: { id: true, actorId: true, actorLabel: true, action: true, targetType: true, targetId: true, requestId: true, idempotencyKey: true, metadata: true, createdAt: true } });
   const status = item.status === "ACTIVE" && item.expiresAt && item.expiresAt <= new Date() ? "EXPIRED" : item.status;
   res.json({ ...item, status, auditEvents: auditRows.map(safeAudit) });
+});
+
+const subscriptionActionSchema = z.object({
+  action: z.enum(["activate", "extend", "renew", "deactivate"]),
+  planId: z.string().min(1).optional(),
+  durationDays: z.number().int().min(1).max(3650).optional(),
+  reason: z.string().trim().min(3).max(500),
+  idempotencyKey: z.string().trim().min(8).max(120)
+}).strict();
+
+async function applySubscriptionAction(req: AuthRequest, userId: string, subscriptionId: string | null, input: z.infer<typeof subscriptionActionSchema>) {
+  return prisma.$transaction(async tx => {
+    const lockedUser = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "User" WHERE "id" = ${userId} FOR UPDATE`;
+    if (!lockedUser.length) return { failure: "USER_NOT_FOUND" as const };
+
+    let current = subscriptionId
+      ? await tx.subscription.findFirst({ where: { id: subscriptionId, userId }, select: subscriptionSelect })
+      : await tx.subscription.findFirst({ where: { userId }, select: subscriptionSelect, orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }, { id: "desc" }] });
+    if (subscriptionId && !current) return { failure: "SUBSCRIPTION_NOT_FOUND" as const };
+
+    const auditAction = `SUBSCRIPTION_ADMIN_${input.action.toUpperCase()}`;
+    if (current) {
+      const prior = await tx.auditEvent.findFirst({ where: { action: auditAction, targetType: "Subscription", targetId: current.id, idempotencyKey: input.idempotencyKey }, select: { metadata: true } });
+      if (prior) {
+        const metadata: any = prior.metadata ?? {};
+        if (metadata.reason !== input.reason || metadata.requestedPlanId !== (input.planId ?? null) || metadata.requestedDurationDays !== (input.durationDays ?? null)) return { failure: "IDEMPOTENCY_KEY_CONFLICT" as const };
+        const subscription = await tx.subscription.findUnique({ where: { id: current.id }, select: { ...subscriptionSelect, plan: { select: planSelect } } });
+        return { subscription, replayed: true as const };
+      }
+    }
+
+    const needsPlan = input.action === "activate" || input.action === "renew";
+    if (needsPlan && !input.planId) return { failure: "PLAN_REQUIRED" as const };
+    const plan = input.planId ? await tx.plan.findUnique({ where: { id: input.planId }, select: planSelect }) : null;
+    if (input.planId && !plan) return { failure: "PLAN_NOT_FOUND" as const };
+    if ((input.action === "activate" || input.action === "renew") && !plan) return { failure: "PLAN_REQUIRED" as const };
+    if (input.action === "extend" && !current) return { failure: "SUBSCRIPTION_NOT_FOUND" as const };
+    if (input.action === "deactivate" && !current) return { failure: "SUBSCRIPTION_NOT_FOUND" as const };
+
+    const now = new Date();
+    const durationDays = input.durationDays ?? plan?.durationDays ?? undefined;
+    if ((input.action === "activate" || input.action === "renew") && !durationDays) return { failure: "DURATION_REQUIRED" as const };
+    if (input.action === "extend" && !durationDays) return { failure: "DURATION_REQUIRED" as const };
+
+    const currentPlanId = input.planId ?? current?.planId;
+    const previousState = current ? { planId: current.planId, status: current.status, startsAt: current.startsAt, expiresAt: current.expiresAt } : null;
+    const next = transitionSubscription(input.action, current, durationDays, now);
+    const { status, startsAt, expiresAt } = next;
+
+    if (!current) {
+      current = await tx.subscription.create({ data: { userId, planId: currentPlanId!, status, startsAt, expiresAt }, select: subscriptionSelect });
+    } else {
+      current = await tx.subscription.update({ where: { id: current.id }, data: { planId: currentPlanId!, status, startsAt, expiresAt }, select: subscriptionSelect });
+    }
+    await audit(tx, req, {
+      action: auditAction, targetType: "Subscription", targetId: current.id, idempotencyKey: input.idempotencyKey,
+      metadata: {
+        action: input.action, userId, reason: input.reason,
+        planId: currentPlanId, requestedPlanId: input.planId ?? null, planName: plan?.name ?? undefined,
+        durationDays: durationDays ?? null, requestedDurationDays: input.durationDays ?? null,
+        previousPlanId: previousState?.planId ?? null, previousStatus: previousState?.status ?? null,
+        previousStartsAt: previousState?.startsAt?.toISOString() ?? null, previousExpiresAt: previousState?.expiresAt?.toISOString() ?? null,
+        status, startsAt: startsAt?.toISOString() ?? null, expiresAt: expiresAt?.toISOString() ?? null
+      }
+    });
+    const subscription = await tx.subscription.findUnique({ where: { id: current.id }, select: { ...subscriptionSelect, plan: { select: planSelect } } });
+    return { subscription, replayed: false as const };
+  });
+}
+
+function parseSubscriptionAction(body: unknown) {
+  const parsed = subscriptionActionSchema.safeParse(body);
+  if (!parsed.success) return null;
+  if ((parsed.data.action === "activate" || parsed.data.action === "renew") && !parsed.data.planId) return null;
+  if ((parsed.data.action === "extend" || parsed.data.action === "renew") && !parsed.data.durationDays && !parsed.data.planId) return null;
+  return parsed.data;
+}
+
+function sendSubscriptionActionResult(res: any, result: any) {
+  if ("failure" in result) {
+    const status = result.failure === "USER_NOT_FOUND" || result.failure === "SUBSCRIPTION_NOT_FOUND" || result.failure === "PLAN_NOT_FOUND" ? 404 : result.failure === "IDEMPOTENCY_KEY_CONFLICT" ? 409 : 400;
+    return res.status(status).json({ error: result.failure });
+  }
+  return res.json(result);
+}
+
+adminRouter.post("/users/:id/subscription", async (req: AuthRequest, res) => {
+  const input = parseSubscriptionAction(req.body);
+  if (!input) return failInput(res);
+  const result = await applySubscriptionAction(req, req.params.id, null, input);
+  return sendSubscriptionActionResult(res, result);
+});
+
+adminRouter.post("/subscriptions/:id/actions", async (req: AuthRequest, res) => {
+  const input = parseSubscriptionAction(req.body);
+  if (!input) return failInput(res);
+  const existing = await prisma.subscription.findUnique({ where: { id: req.params.id }, select: { userId: true } });
+  if (!existing) return res.status(404).json({ error: "SUBSCRIPTION_NOT_FOUND" });
+  const result = await applySubscriptionAction(req, existing.userId, req.params.id, input);
+  return sendSubscriptionActionResult(res, result);
+});
+
+adminRouter.get("/plans", async (_req, res) => {
+  res.json(await prisma.plan.findMany({ select: planSelect, orderBy: [{ active: "desc" }, { priceKes: "asc" }, { id: "asc" }] }));
 });
 adminRouter.post("/subscriptions/:id/extend", async (req: AuthRequest, res) => {
   const parsed = z.object({ days: z.number().int().min(1).max(365), reason: z.string().trim().min(3).max(500), idempotencyKey: z.string().trim().min(8).max(120) }).safeParse(req.body); if (!parsed.success) return failInput(res);

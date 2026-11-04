@@ -53,6 +53,8 @@ enum SignatureStatus {
 enum OtpPurpose {
   LOGIN
   PASSWORD_RESET
+  REGISTRATION
+  PHONE_CHANGE
 }
 
 model User {
@@ -219,6 +221,7 @@ model Payment {
   amountKes           Int
   status              PaymentStatus @default(PENDING)
   providerPayload     Json?
+  requestIdempotencyKey String? @unique
   verifiedAt          DateTime?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt

@@ -32,7 +32,6 @@ services:
         value: https://bulksms.talksasa.com/api/v3/
       - key: OTP_HASH_SECRET
         sync: false
-        sync: false
       - key: WEB_ORIGIN
         value: https://portal.bingwasokoni.top
       - key: PORT

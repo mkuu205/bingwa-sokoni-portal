@@ -77,12 +77,26 @@ export default function AdminPanel({ username, onLogout }: { username: string; o
   const [busy, setBusy] = useState(false);
   const [adjustForm, setAdjustForm] = useState({ direction: "CREDIT", amount: "", reason: "" });
   const [extendForm, setExtendForm] = useState({ days: "", reason: "" });
+  const [subscriptionPlans, setSubscriptionPlans] = useState<Plan[]>([]);
+  const [subscriptionForm, setSubscriptionForm] = useState({ action: "activate", planId: "", durationDays: "", reason: "" });
+  const [subscriptionKey, setSubscriptionKey] = useState("");
   const [adjustKey, setAdjustKey] = useState(""); const [extendKey, setExtendKey] = useState("");
   const [mobileNav, setMobileNav] = useState(false);
   const [planDrafts, setPlanDrafts] = useState<Record<string, Plan>>({});
   const [savingPlan, setSavingPlan] = useState("");
-  const idempotency = useRef<{ adjust: string; extend: string }>({ adjust: "", extend: "" });
+  const idempotency = useRef<{ adjust: string; extend: string; subscription: string }>({ adjust: "", extend: "", subscription: "" });
   const mutationLock = useRef(false);
+
+  useEffect(() => {
+    if (detail && (detail.kind === "users" || detail.kind === "subscriptions")) {
+      void api<Plan[]>("/api/admin/plans").then(setSubscriptionPlans).catch(e => setNotice({ ok: false, text: e instanceof Error ? e.message : "Could not load subscription plans" }));
+    }
+  }, [detail?.kind, detail?.id]);
+  useEffect(() => {
+    if (!subscriptionForm.planId && subscriptionPlans.length) {
+      setSubscriptionForm(current => ({ ...current, planId: (subscriptionPlans.find(plan => plan.active) ?? subscriptionPlans[0]).id }));
+    }
+  }, [subscriptionPlans, subscriptionForm.planId]);
 
   const fetchOverview = useCallback(async () => {
     setOverviewLoading(true); setOverviewError("");
@@ -121,7 +135,9 @@ export default function AdminPanel({ username, onLogout }: { username: string; o
     const id = String(entity === "tokens" ? row.userId ?? row.id : row.id ?? row.targetId ?? "");
     setDetail({ kind: entity, id, row, loading: entity !== "audit-logs" });
     if (!preserveMutation) { setAdjustForm({ direction: "CREDIT", amount: "", reason: "" }); setExtendForm({ days: "", reason: "" }); setLedgerPage(1);
-      setAdjustKey(""); setExtendKey(""); idempotency.current = { adjust: "", extend: "" }; }
+      setAdjustKey(""); setExtendKey(""); setSubscriptionKey("");
+      setSubscriptionForm({ action: entity === "users" ? "activate" : "extend", planId: String(row.planId ?? row.plan?.id ?? ""), durationDays: "", reason: "" });
+      idempotency.current = { adjust: "", extend: "", subscription: "" }; }
     if (entity === "audit-logs") { setDetail({ kind: entity, id, row, data: row }); return; }
     const effectiveLedgerPage = requestedLedgerPage ?? (preserveMutation ? ledgerPage : 1);
     if (entity === "tokens") setLedgerPage(effectiveLedgerPage);
@@ -153,6 +169,32 @@ export default function AdminPanel({ username, onLogout }: { username: string; o
     if (!idempotency.current.extend) idempotency.current.extend = idempotencyKey(); setExtendKey(idempotency.current.extend);
     mutationLock.current = true; setBusy(true); try { await api(`/api/admin/subscriptions/${encodeURIComponent(detail.id)}/extend`, { method: "POST", body: JSON.stringify({ days: Number(extendForm.days), reason: extendForm.reason.trim(), idempotencyKey: idempotency.current.extend }) }); idempotency.current.extend = ""; setExtendKey(""); await reloadCurrent(); await reloadDetail(); setNotice({ ok: true, text: "Subscription extended." }); }
     catch (e) { showFailure(e); } finally { mutationLock.current = false; setBusy(false); }
+  };
+  const submitSubscriptionAction = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!detail || mutationLock.current || subscriptionForm.reason.trim().length < 3) return;
+    const action = subscriptionForm.action;
+    if ((action === "activate" || action === "renew") && !subscriptionForm.planId) { setNotice({ ok: false, text: "Select a plan." }); return; }
+    const days = subscriptionForm.durationDays.trim() ? Number(subscriptionForm.durationDays) : undefined;
+    if (days !== undefined && (!Number.isInteger(days) || days < 1 || days > 3650)) { setNotice({ ok: false, text: "Duration must be from 1 to 3,650 days." }); return; }
+    const actionLabel = action.charAt(0).toUpperCase() + action.slice(1);
+    if (!window.confirm(`${actionLabel} this user's subscription?`)) return;
+    if (!idempotency.current.subscription) idempotency.current.subscription = idempotencyKey();
+    setSubscriptionKey(idempotency.current.subscription);
+    mutationLock.current = true; setBusy(true);
+    try {
+      const endpoint = detail.kind === "users"
+        ? `/api/admin/users/${encodeURIComponent(detail.id)}/subscription`
+        : `/api/admin/subscriptions/${encodeURIComponent(detail.id)}/actions`;
+      await api(endpoint, { method: "POST", body: JSON.stringify({
+        action, planId: subscriptionForm.planId || undefined, durationDays: days,
+        reason: subscriptionForm.reason.trim(), idempotencyKey: idempotency.current.subscription
+      }) });
+      idempotency.current.subscription = ""; setSubscriptionKey("");
+      await reloadCurrent(); await reloadDetail();
+      setNotice({ ok: true, text: `Subscription ${action} action saved and audited.` });
+    } catch (e) { showFailure(e); }
+    finally { mutationLock.current = false; setBusy(false); }
   };
   const adjustTokens = async (event: FormEvent) => {
     event.preventDefault(); if (!detail || adjustForm.reason.trim().length < 10 || mutationLock.current) return;
@@ -226,7 +268,15 @@ export default function AdminPanel({ username, onLogout }: { username: string; o
         {detail.kind === "users" ? <><SafeFields data={userRecord ?? {}} fields={detailFields.users}/>{["devices", "subscriptions", "payments", "auditEvents"].map(key => <section className="ap-detail-group" key={key}><h3>{titleCase(key)}</h3>{Array.isArray(dataForDetail?.[key]) && dataForDetail[key].length ? dataForDetail[key].map((item: any, i: number) => <div className="ap-mini-record" key={item.id ?? i}><SafeFields data={item} fields={key === "devices" ? detailFields.devices : key === "payments" ? detailFields.payments : key === "subscriptions" ? detailFields.subscriptions : detailFields["audit-logs"]}/></div>) : <p className="ap-muted">No {key} records returned.</p>}</section>)}</> : detail.kind === "tokens" ? <><SafeFields data={dataForDetail?.user ?? detail.row} fields={detailFields.tokens.filter(f => f !== "items")}/><div className="ap-detail-group"><h3>Token ledger</h3>{Array.isArray(dataForDetail?.items) && dataForDetail.items.length ? dataForDetail.items.map((item: any, i: number) => <div className="ap-mini-record" key={item.id ?? i}><SafeFields data={item} fields={["id", "delta", "balanceAfter", "reason", "reference", "createdAt"]}/></div>) : <p className="ap-muted">No ledger entries returned.</p>}{dataForDetail?.total > 10 && <div className="ap-pagination"><span>Page {dataForDetail.page} of {Math.max(1, Math.ceil(dataForDetail.total / dataForDetail.pageSize))}</span><div><button className="ap-button secondary" disabled={ledgerPage <= 1 || busy} onClick={() => void openDetail("tokens", detail.row, true, ledgerPage - 1)}>Previous</button><button className="ap-button secondary" disabled={ledgerPage * 10 >= dataForDetail.total || busy} onClick={() => void openDetail("tokens", detail.row, true, ledgerPage + 1)}>Next</button></div></div>}</div></> : <><SafeFields data={detailRecord ?? detail.row} fields={detailFields[detail.kind]}/>{detail.kind === "devices" && (dataForDetail?.owner ?? dataForDetail?.user ?? detailRecord?.owner ?? detailRecord?.user) && <section className="ap-detail-group"><h3>Owner</h3><SafeFields data={dataForDetail?.owner ?? dataForDetail?.user ?? detailRecord.owner ?? detailRecord.user} fields={["id", "phone", "role"]}/></section>}{detail.kind === "subscriptions" && (dataForDetail?.plan ?? detailRecord?.plan) && <section className="ap-detail-group"><h3>Plan</h3><SafeFields data={dataForDetail?.plan ?? detailRecord.plan} fields={["id", "code", "name", "priceKes", "durationDays", "maxDevices", "transactionHistoryDays", "active"]}/></section>}</>}
         {detail.kind === "users" && <div className="ap-action"><button className={`ap-button ${userRecord?.suspendedAt ? "primary" : "danger"}`} disabled={busy} onClick={() => void toggleSuspension()}>{busy ? "Working…" : userRecord?.suspendedAt ? "Reactivate account" : "Suspend account"}</button></div>}
         {detail.kind === "devices" && <div className="ap-action"><button className="ap-button danger" disabled={busy || String(detailRecord?.status ?? detail.row.status).toUpperCase() === "REVOKED"} onClick={() => void revokeDevice()}>{busy ? "Working…" : "Revoke device"}</button></div>}
-        {detail.kind === "subscriptions" && <form className="ap-mutation" onSubmit={e => void extendSubscription(e)}><h3>Extend subscription</h3><label>Additional days<input type="number" min="1" step="1" required value={extendForm.days} onChange={e => setExtendForm(v => ({ ...v, days: e.target.value }))}/></label><label>Reason (required)<textarea required minLength={3} value={extendForm.reason} onChange={e => setExtendForm(v => ({ ...v, reason: e.target.value }))}/></label><button className="ap-button primary" disabled={busy || extendForm.reason.trim().length < 3}>{busy ? "Submitting…" : extendKey ? "Retry extension" : "Extend subscription"}</button></form>}
+        {(detail.kind === "users" || detail.kind === "subscriptions") && <form className="ap-mutation" onSubmit={e => void submitSubscriptionAction(e)}>
+          <h3>Subscription management</h3>
+          <label>Action<select value={subscriptionForm.action} onChange={e => setSubscriptionForm(v => ({ ...v, action: e.target.value }))}><option value="activate">Activate</option><option value="extend">Extend</option><option value="renew">Renew</option><option value="deactivate">Deactivate</option></select></label>
+          <label>Plan<select value={subscriptionForm.planId} onChange={e => setSubscriptionForm(v => ({ ...v, planId: e.target.value }))}><option value="">Select a plan</option>{subscriptionPlans.map(plan => <option key={plan.id} value={plan.id}>{plan.name} · KSh {plan.priceKes} · {plan.durationDays} days{plan.active ? "" : " · inactive"}</option>)}</select></label>
+          <label>Duration override in days (optional)<input type="number" min="1" max="3650" step="1" value={subscriptionForm.durationDays} onChange={e => setSubscriptionForm(v => ({ ...v, durationDays: e.target.value }))} placeholder="Use the selected plan duration"/></label>
+          <label>Reason (required)<textarea required minLength={3} value={subscriptionForm.reason} onChange={e => setSubscriptionForm(v => ({ ...v, reason: e.target.value }))}/></label>
+          <button className="ap-button primary" disabled={busy || subscriptionForm.reason.trim().length < 3 || subscriptionPlans.length === 0}>{busy ? "Saving…" : subscriptionKey ? "Retry action" : `${subscriptionForm.action[0].toUpperCase()}${subscriptionForm.action.slice(1)} subscription`}</button>
+          <p className="ap-muted">The API updates the existing subscription when available, saves the change in the database, and records an audit event. Payment records are never marked paid by this action.</p>
+        </form>}
         {detail.kind === "tokens" && <form className="ap-mutation" onSubmit={e => void adjustTokens(e)}><h3>Manual token adjustment</h3><label>Direction<select value={adjustForm.direction} onChange={e => setAdjustForm(v => ({ ...v, direction: e.target.value }))}><option value="CREDIT">Credit</option><option value="DEBIT">Debit</option></select></label><label>Amount<input type="number" min="1" step="1" required value={adjustForm.amount} onChange={e => setAdjustForm(v => ({ ...v, amount: e.target.value }))}/></label><label>Reason (required)<textarea required minLength={10} value={adjustForm.reason} onChange={e => setAdjustForm(v => ({ ...v, reason: e.target.value }))}/></label><button className="ap-button primary" disabled={busy || adjustForm.reason.trim().length < 10}>{busy ? "Submitting…" : adjustKey ? "Retry adjustment" : "Submit adjustment"}</button><p className="ap-muted">The backend ledger is the source of truth for balances.</p></form>}
         {detail.kind === "devices" && Array.isArray(dataForDetail?.commands) && <section className="ap-detail-group"><h3>Recent command lifecycle</h3>{dataForDetail.commands.length ? dataForDetail.commands.map((command: any) => <div className="ap-mini-record" key={command.id}><SafeFields data={command} fields={["id", "commandType", "status", "expiresAt", "deliveredAt", "startedAt", "completedAt", "errorMessage", "createdAt"]}/></div>) : <p className="ap-muted">No recent commands returned.</p>}</section>}
         {detail.kind === "payments" && <div className="ap-readonly-note"><ShieldCheck size={16}/> Payment records are read-only. This console cannot mark payments as paid.</div>}

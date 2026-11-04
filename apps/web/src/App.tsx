@@ -6,7 +6,7 @@ import { resolveRoute } from "./route-state.js";
 import AdminPanel from "./AdminPanel";
 
 type Device = { id: string; deviceName: string; status: string; lastSeenAt?: string | null; appVersion?: string | null; model?: string | null; automationEnabled: boolean; executionState: string };
-type Me = { id: string; phone: string; role: string; tokenBalance: number; devices: Device[]; subscriptions: any[] };
+type Me = { id: string; phone: string; role: string; phoneVerifiedAt?: string | null; tokenBalance: number; devices: Device[]; subscriptions: any[]; subscription?: any | null };
 type Tx = { id: string; phoneNumber: string; packageName: string; amountKes: string; status: string; lastSyncedAt: string; device: { deviceName: string } };
 type AdminOverview = { users: number; devices: number; pendingPayments: number; activeSubscriptions: number; queuedCommands: number };
 type BillingPlan = { id: string; code: string; name: string; priceKes: number; durationDays: number; maxDevices: number | null; transactionHistoryDays: number; active?: boolean };
@@ -29,6 +29,7 @@ const nav = [
 
 function money(value: unknown) { return `KSh ${Number(value || 0).toLocaleString("en-KE")}`; }
 function time(value?: string | null) { return value ? new Date(value).toLocaleString() : "Not connected yet"; }
+function requestKey() { return globalThis.crypto?.randomUUID?.() ?? `portal-${Date.now()}-${Math.random().toString(36).slice(2)}`; }
 
 export default function App() {
   const [page, setPage] = useState("Overview");
@@ -45,7 +46,7 @@ export default function App() {
   const [adminUsername, setAdminUsername] = useState("kish");
   const [adminPassword, setAdminPassword] = useState("");
   const [registering, setRegistering] = useState(false);
-  const [authStep, setAuthStep] = useState<"credentials" | "login-otp" | "forgot-phone" | "reset-otp">("credentials");
+  const [authStep, setAuthStep] = useState<"credentials" | "registration-otp" | "forgot-phone" | "reset-otp">("credentials");
   const [otpCode, setOtpCode] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [pairCode, setPairCode] = useState("");
@@ -63,6 +64,8 @@ export default function App() {
   const [billingNotice, setBillingNotice] = useState("");
   const [billingPayments, setBillingPayments] = useState<BillingPayment[]>([]);
   const [tokenLedger, setTokenLedger] = useState<any[]>([]);
+  const [phoneChange, setPhoneChange] = useState({ phone: "", code: "", step: "idle" as "idle" | "code" });
+  const [phoneChangeNotice, setPhoneChangeNotice] = useState("");
 
   function navigate(to: string, replace = false) {
     if (replace) window.history.replaceState({}, "", to);
@@ -133,6 +136,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!me) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const profile = await api<Me>("/api/me");
+        setMe(profile);
+        if (["Subscription", "Buy Tokens", "Token History"].includes(page)) setBillingPayments(await api<BillingPayment[]>("/api/billing/payments"));
+      } catch { /* Session refresh remains available through the header button. */ }
+    }, page === "Subscription" ? 15000 : 45000);
+    return () => window.clearInterval(timer);
+  }, [me?.id, page]);
+
+  useEffect(() => {
     if (!me || !["Subscription", "Buy Tokens", "Token History"].includes(page)) return;
     let cancelled = false;
     const loadBilling = async () => {
@@ -165,7 +180,7 @@ export default function App() {
       const result = await api<any>(registering ? "/api/auth/register" : "/api/auth/login", {
         method: "POST", body: JSON.stringify({ phone: loginPhone, password: loginPassword })
       });
-      if (result.requiresOtp) { setAuthStep("login-otp"); setError(""); return; }
+      if (result.requiresOtp) { setAuthStep("registration-otp"); setError(""); return; }
       localStorage.setItem("bingwa_token", result.token);
       localStorage.removeItem("bingwa_admin_username");
       setAuthReady(false); navigate(result.user?.role === "ADMIN" ? "/admin" : "/");
@@ -174,10 +189,10 @@ export default function App() {
   }
 
 
-  async function verifyLoginOtp(event: FormEvent<HTMLFormElement>) {
+  async function verifyRegistrationOtp(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError("");
     try {
-      const result = await api<any>("/api/auth/login/verify", { method: "POST", body: JSON.stringify({ phone: loginPhone, code: otpCode }) });
+      const result = await api<any>("/api/auth/register/verify", { method: "POST", body: JSON.stringify({ phone: loginPhone, code: otpCode }) });
       localStorage.setItem("bingwa_token", result.token); localStorage.removeItem("bingwa_admin_username");
       setAuthStep("credentials"); setOtpCode(""); setAuthReady(false); navigate("/"); await refresh();
     } catch (e) { setError(e instanceof Error ? e.message : "Verification failed"); }
@@ -193,6 +208,21 @@ export default function App() {
       await api("/api/auth/password/reset", { method: "POST", body: JSON.stringify({ phone: loginPhone, code: otpCode, newPassword }) });
       setAuthStep("credentials"); setOtpCode(""); setNewPassword(""); setLoginPassword(""); setError("Password updated. Sign in with your new password.");
     } catch (e) { setError(e instanceof Error ? e.message : "Password reset failed"); }
+  }
+  async function requestPhoneChange(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setPhoneChangeNotice("");
+    try {
+      const result = await api<{ message: string }>("/api/account/phone/change/request", { method: "POST", body: JSON.stringify({ phone: phoneChange.phone }) });
+      setPhoneChange(v => ({ ...v, step: "code" })); setPhoneChangeNotice(result.message);
+    } catch (e) { setPhoneChangeNotice(e instanceof Error ? e.message : "Could not send verification code"); }
+  }
+  async function verifyPhoneChange(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setPhoneChangeNotice("");
+    try {
+      const result = await api<{ phone: string }>("/api/account/phone/change/verify", { method: "POST", body: JSON.stringify({ phone: phoneChange.phone, code: phoneChange.code }) });
+      setMe(current => current ? { ...current, phone: result.phone, phoneVerifiedAt: new Date().toISOString() } : current);
+      setPhoneChange({ phone: "", code: "", step: "idle" }); setPhoneChangeNotice("Phone number updated and verified.");
+    } catch (e) { setPhoneChangeNotice(e instanceof Error ? e.message : "Phone verification failed"); }
   }
   async function adminAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError("");
@@ -230,16 +260,16 @@ export default function App() {
   async function purchaseSubscription(planId: string) {
     setBillingBusy(true); setBillingNotice("");
     try {
-      const result = await api<{ paymentId: string; externalReference: string; status: string }>("/api/billing/subscriptions", { method: "POST", body: JSON.stringify({ planId, phoneNumber: billingPhone || me?.phone || "" }) });
+      const result = await api<{ paymentId: string; externalReference: string; status: string }>("/api/billing/subscriptions", { method: "POST", body: JSON.stringify({ planId, phoneNumber: billingPhone || me?.phone || "", idempotencyKey: requestKey() }) });
       setBillingNotice(`M-Pesa STK Push requested. Check the phone. Reference: ${result.externalReference}. Subscription activates only after verified payment.`);
-      const payments = await api<BillingPayment[]>("/api/billing/payments"); setBillingPayments(payments);
+      const [payments, profile] = await Promise.all([api<BillingPayment[]>("/api/billing/payments"), api<Me>("/api/me")]); setBillingPayments(payments); setMe(profile);
     } catch (e) { setBillingNotice(e instanceof Error ? e.message : "Could not initiate payment"); }
     finally { setBillingBusy(false); }
   }
   async function purchaseTokens(packageCode: string) {
     setBillingBusy(true); setBillingNotice("");
     try {
-      const result = await api<{ paymentId: string; externalReference: string; status: string }>("/api/billing/tokens", { method: "POST", body: JSON.stringify({ packageCode, phoneNumber: billingPhone || me?.phone || "" }) });
+      const result = await api<{ paymentId: string; externalReference: string; status: string }>("/api/billing/tokens", { method: "POST", body: JSON.stringify({ packageCode, phoneNumber: billingPhone || me?.phone || "", idempotencyKey: requestKey() }) });
       setBillingNotice(`M-Pesa STK Push requested. Check the phone. Reference: ${result.externalReference}. Tokens are credited only after verified payment.`);
       const payments = await api<BillingPayment[]>("/api/billing/payments"); setBillingPayments(payments);
     } catch (e) { setBillingNotice(e instanceof Error ? e.message : "Could not initiate payment"); }
@@ -270,12 +300,12 @@ export default function App() {
   if (!me) return <div className="auth-shell">
     <div className="auth-card">
       <div className="brand-mark">B</div><div className="eyebrow">BINGWA SOKONI</div>
-      <h1>{authStep === "login-otp" ? "Verify your login" : authStep === "forgot-phone" ? "Forgot password" : authStep === "reset-otp" ? "Reset password" : registering ? "Create your account" : "Welcome back"}</h1>
-      <p className="muted">{authStep === "login-otp" ? `Enter the six-digit code sent to ${loginPhone}.` : authStep === "forgot-phone" ? "Enter the phone number registered to your account." : authStep === "reset-otp" ? "Enter the recovery code and choose a new password." : "Manage your connected phones, automation and tokens in one place."}</p>
+      <h1>{authStep === "registration-otp" ? "Verify your phone" : authStep === "forgot-phone" ? "Forgot password" : authStep === "reset-otp" ? "Reset password" : registering ? "Create your account" : "Welcome back"}</h1>
+      <p className="muted">{authStep === "registration-otp" ? `Enter the six-digit code sent to ${loginPhone} to complete registration.` : authStep === "forgot-phone" ? "Enter the phone number registered to your account." : authStep === "reset-otp" ? "Enter the recovery code and choose a new password." : "Manage your connected phones, automation and tokens in one place."}</p>
       {error && <div className="alert">{error}</div>}
-      {authStep === "login-otp" && <form onSubmit={verifyLoginOtp}>
-        <label>Six-digit verification code</label><input inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={otpCode} onChange={e=>setOtpCode(e.target.value.replace(/\D/g, "").slice(0,6))} required />
-        <button className="primary full" type="submit">Verify and sign in</button>
+      {authStep === "registration-otp" && <form onSubmit={verifyRegistrationOtp}>
+        <label>Six-digit phone verification code</label><input inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={otpCode} onChange={e=>setOtpCode(e.target.value.replace(/\D/g, "").slice(0,6))} required />
+        <button className="primary full" type="submit">Verify phone and finish registration</button>
         <button className="text-button full" type="button" onClick={()=>{setAuthStep("credentials");setOtpCode("");}}>Back to sign in</button>
       </form>}
       {authStep === "forgot-phone" && <form onSubmit={requestPasswordReset}>
@@ -295,12 +325,13 @@ export default function App() {
         <button className="primary full" onClick={auth}>{registering ? "Create account" : "Continue"}</button>
         <button className="text-button full" onClick={()=>setRegistering(!registering)}>{registering ? "Already have an account? Sign in" : "New to Bingwa? Create an account"}</button>
       </>}
-      <div className="auth-foot"><ShieldCheck size={15}/> Login verification and password recovery via TalkSasa SMS.</div>
+      <div className="auth-foot"><ShieldCheck size={15}/> Phone verification during registration and password recovery via TalkSasa SMS.</div>
     </div>
   </div>;
 
   const online = me.devices.filter(d => d.status === "ONLINE").length;
-  const activeSub = me.subscriptions?.find(s => s.status === "ACTIVE" && s.expiresAt && new Date(s.expiresAt) > new Date());
+  const effectiveSub = me.subscription !== undefined ? me.subscription : me.subscriptions?.find(s => s.status === "ACTIVE" && s.expiresAt && new Date(s.expiresAt) > new Date());
+  const activeSub = effectiveSub?.status === "ACTIVE" && effectiveSub.expiresAt && new Date(effectiveSub.expiresAt) > new Date() ? effectiveSub : null;
   const title = page === "Overview" ? "Dashboard overview" : page;
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNav ? "open" : ""}`}>
@@ -344,8 +375,8 @@ export default function App() {
         {page==="Approved Signatures"&&<section className="panel"><div className="panel-heading"><div><h3>Approved signatures</h3><p>Approved signatures may be shared only with compatible devices on this account.</p></div></div><Empty title="No signature records to display" detail="Signature upload, version history and revocation endpoints are the next integration step." /></section>}
         {page==="Buy Tokens"&&<section className="panel"><div className="panel-heading"><div><h3>Buy tokens</h3><p>Pay by M-Pesa STK Push. Tokens are credited only after provider verification.</p></div></div><div className="balance-card"><span>Current token balance</span><strong>{me.tokenBalance}</strong><small>Shared account balance</small></div><label className="billing-label">M-Pesa phone number</label><input className="billing-input" value={billingPhone} onChange={e=>setBillingPhone(e.target.value)} placeholder={me.phone || "07XXXXXXXX or 2547XXXXXXXX"} />{billingNotice&&<div className="notice"><ShieldCheck size={18}/><div>{billingNotice}</div></div>}{tokenPackages.length===0?<div className="notice"><ShieldCheck size={18}/><div><strong>Token packages unavailable</strong><p>Please refresh the page or contact support if this continues.</p></div></div>:<div className="plan-grid">{tokenPackages.map(pack=><div className="plan-card" key={pack.code}><span className="plan-label">TOKEN PACKAGE</span><h3>{pack.name}</h3><div className="plan-price">{money(pack.amountKes)}</div><p><CheckCircle2 size={15}/>{pack.tokens.toLocaleString()} tokens</p><button className="primary full" disabled={billingBusy} onClick={()=>void purchaseTokens(pack.code)}>{billingBusy?"Requesting…":"Pay with M-Pesa"}</button></div>)}</div>}</section>}
         {page==="Token History"&&<section className="panel"><div className="panel-heading"><div><h3>Token history</h3><p>Token ledger and payment status.</p></div><button className="icon-button" onClick={()=>void refresh()}><RefreshCw size={16}/></button></div>{tokenLedger.length===0?<Empty title="No token ledger entries" detail="Verified token purchases and ledger adjustments will appear here."/>:<div className="table-wrap"><table><thead><tr><th>Date</th><th>Reason</th><th>Change</th><th>Balance after</th><th>Reference</th></tr></thead><tbody>{tokenLedger.map(entry=><tr key={entry.id}><td>{time(entry.createdAt)}</td><td>{entry.reason}</td><td>{entry.delta>0?"+":""}{entry.delta}</td><td>{entry.balanceAfter}</td><td>{entry.reference}</td></tr>)}</tbody></table></div>}<h3>Recent payments</h3>{billingPayments.length===0?<Empty title="No payments yet" detail="Your PayHero payment attempts will appear here."/>:<div className="table-wrap"><table><thead><tr><th>Date</th><th>Reference</th><th>Purpose</th><th>Amount</th><th>Status</th></tr></thead><tbody>{billingPayments.map(payment=><tr key={payment.id}><td>{time(payment.createdAt)}</td><td>{payment.externalReference}</td><td>{payment.purpose.startsWith("TOKENS:")?"Token purchase":payment.purpose.startsWith("SUBSCRIPTION:")?"Subscription":"Other"}</td><td>{money(payment.amountKes)}</td><td>{payment.status}</td></tr>)}</tbody></table></div>}</section>}
-        {page==="Subscription"&&<><section className="panel"><div className="panel-heading"><div><h3>Choose a subscription</h3><p>Pay with M-Pesa. Your subscription changes only after PayHero verification.</p></div></div><label className="billing-label">M-Pesa phone number</label><input className="billing-input" value={billingPhone} onChange={e=>setBillingPhone(e.target.value)} placeholder={me.phone || "07XXXXXXXX or 2547XXXXXXXX"} />{billingNotice&&<div className="notice"><ShieldCheck size={18}/><div>{billingNotice}</div></div>}<div className="plan-grid">{billingPlans.filter(p=>p.active !== false).map(p=><div className={`plan-card ${activeSub?.plan?.name===p.name?"plan-current":""}`} key={p.id}><span className="plan-label">{activeSub?.plan?.name===p.name?"CURRENT PLAN":`${p.durationDays} DAYS`}</span><h3>{p.name}</h3><div className="plan-price">{money(p.priceKes)}<small>/{p.durationDays} days</small></div><p><CheckCircle2 size={15}/>{p.maxDevices==null?"Unlimited devices":`Up to ${p.maxDevices} devices`}</p><p><CheckCircle2 size={15}/>{p.transactionHistoryDays}-day transaction history</p><button className="primary full" disabled={billingBusy} onClick={()=>void purchaseSubscription(p.id)}>{billingBusy?"Requesting…":activeSub?.plan?.name===p.name?"Renew with M-Pesa":"Subscribe with M-Pesa"}</button></div>)}</div></section><div className="notice"><CreditCard size={18}/><div><strong>Subscription renewal</strong><p>Your account remains accessible when a subscription expires, but subscription-dependent automation and remote commands must be disabled until renewal is confirmed.</p></div></div></>}
-        {page==="Account Settings"&&<section className="panel"><div className="panel-heading"><div><h3>Account settings</h3><p>Profile and account security</p></div></div><div className="settings-row"><div><strong>Phone number</strong><span>{me.phone}</span></div><span className="tag pending">Verification provider required</span></div><div className="settings-row"><div><strong>Account role</strong><span>{me.role}</span></div></div><div className="settings-row"><div><strong>Security</strong><span>Password recovery and phone OTP must be configured before production.</span></div></div><button className="secondary" onClick={logout}><LogOut size={15}/> Sign out</button></section>}
+        {page==="Subscription"&&<><section className="panel"><div className="panel-heading"><div><h3>Your subscription</h3><p>Live status from the same profile data used by your dashboard.</p></div><button className="icon-button" onClick={()=>void refresh()} title="Refresh subscription status"><RefreshCw size={16}/></button></div><div className="settings-row"><div><strong>Status</strong><span className={`tag ${activeSub?"success":"pending"}`}>{activeSub?"ACTIVE":effectiveSub?.status==="ACTIVE"?"EXPIRED":effectiveSub?.status??"INACTIVE"}</span></div></div><div className="settings-row"><div><strong>Selected plan</strong><span>{effectiveSub?.plan?.name??"No plan selected"}</span></div></div><div className="settings-row"><div><strong>Activation date</strong><span>{effectiveSub?.startsAt?time(effectiveSub.startsAt):"—"}</span></div></div><div className="settings-row"><div><strong>Expiry date</strong><span>{effectiveSub?.expiresAt?time(effectiveSub.expiresAt):"—"}</span></div></div>{billingPayments.filter(payment=>payment.purpose.startsWith("SUBSCRIPTION:")&&payment.status==="PENDING").slice(0,3).map(payment=><div className="notice" key={payment.id}><CreditCard size={18}/><div>Payment pending verification · {payment.externalReference} · {money(payment.amountKes)}</div></div>)}</section><section className="panel"><div className="panel-heading"><div><h3>Choose a subscription</h3><p>Pay with M-Pesa. Your subscription changes only after PayHero verification.</p></div></div><label className="billing-label">M-Pesa phone number</label><input className="billing-input" value={billingPhone} onChange={e=>setBillingPhone(e.target.value)} placeholder={me.phone || "07XXXXXXXX or 2547XXXXXXXX"} />{billingNotice&&<div className="notice"><ShieldCheck size={18}/><div>{billingNotice}</div></div>}<div className="plan-grid">{billingPlans.filter(p=>p.active !== false).map(p=><div className={`plan-card ${activeSub?.planId===p.id?"plan-current":""}`} key={p.id}><span className="plan-label">{activeSub?.planId===p.id?"CURRENT PLAN":`${p.durationDays} DAYS`}</span><h3>{p.name}</h3><div className="plan-price">{money(p.priceKes)}<small>/{p.durationDays} days</small></div><p><CheckCircle2 size={15}/>{p.maxDevices==null?"Unlimited devices":`Up to ${p.maxDevices} devices`}</p><p><CheckCircle2 size={15}/>{p.transactionHistoryDays}-day transaction history</p><button className="primary full" disabled={billingBusy} onClick={()=>void purchaseSubscription(p.id)}>{billingBusy?"Requesting…":activeSub?.planId===p.id?"Renew with M-Pesa":"Subscribe with M-Pesa"}</button></div>)}</div></section><div className="notice"><CreditCard size={18}/><div><strong>Subscription renewal</strong><p>Your account remains accessible when a subscription expires, but subscription-dependent automation and remote commands must be disabled until renewal is confirmed.</p></div></div></>}
+        {page==="Account Settings"&&<section className="panel"><div className="panel-heading"><div><h3>Account settings</h3><p>Profile and account security</p></div></div><div className="settings-row"><div><strong>Phone number</strong><span>{me.phone}</span></div><span className={`tag ${me.phoneVerifiedAt?"success":"pending"}`}>{me.phoneVerifiedAt?"VERIFIED":"UNVERIFIED"}</span></div>{phoneChangeNotice&&<div className="notice"><ShieldCheck size={18}/><div>{phoneChangeNotice}</div></div>}{phoneChange.step==="idle"?<form className="billing-phone-change" onSubmit={requestPhoneChange}><label className="billing-label">Change phone number</label><input className="billing-input" value={phoneChange.phone} onChange={e=>setPhoneChange(v=>({...v,phone:e.target.value}))} placeholder="07XXXXXXXX or 2547XXXXXXXX" required/><button className="secondary" type="submit">Send verification code</button></form>:<form className="billing-phone-change" onSubmit={verifyPhoneChange}><p>Enter the six-digit code sent to {phoneChange.phone}.</p><label className="billing-label">Verification code</label><input className="billing-input" inputMode="numeric" maxLength={6} value={phoneChange.code} onChange={e=>setPhoneChange(v=>({...v,code:e.target.value.replace(/\D/g,"").slice(0,6)}))} required/><button className="primary" type="submit">Verify and update number</button><button className="text-button" type="button" onClick={()=>setPhoneChange(v=>({...v,step:"idle",code:""}))}>Use a different number</button></form>}<div className="settings-row"><div><strong>Account role</strong><span>{me.role}</span></div></div><div className="settings-row"><div><strong>Security</strong><span>Sign in with your phone number and password. Phone verification is requested only during registration and phone changes.</span></div></div><button className="secondary" onClick={logout}><LogOut size={15}/> Sign out</button></section>}
         {page==="Admin Panel"&&<section className="panel"><div className="panel-heading"><div><h3>Administration</h3><p>Restricted account overview. Detailed management actions require separate audited endpoints.</p></div></div><Empty title="Admin overview API is ready" detail="User, subscription, device, payment, token and audit-log management screens need to be wired to role-protected admin endpoints. Separate transaction/signature monitoring pages are intentionally omitted." /></section>}
         <footer className="footer"><span>© 2026 Bingwa Sokoni Portal</span><span><i/> Secure connection architecture</span><span>{loading?"Syncing…":"Last refreshed just now"}</span></footer>
       </div>
