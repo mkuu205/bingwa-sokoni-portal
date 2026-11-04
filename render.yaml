@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: bingwa-sokoni-portal-api
+    runtime: node
+    rootDir: .
+    buildCommand: npm install && npm run db:generate && npm run build
+    startCommand: npm run db:deploy && npm run start -w apps/api
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        sync: false
+      - key: ADMIN_USERNAME
+        value: kish
+      - key: ADMIN_PASSWORD_HASH
+        sync: false
+      - key: PAIRING_CODE_PEPPER
+        sync: false
+      - key: PAYHERO_AUTHORIZATION_TOKEN
+        sync: false
+      - key: PAYHERO_CHANNEL_ID
+        sync: false
+      - key: PAYHERO_CALLBACK_URL
+        sync: false
+      - key: TALKSASA_API_KEY
+        sync: false
+      - key: TALKSASA_SENDER_ID
+        sync: false
+      - key: TALKSASA_API_URL
+        value: https://bulksms.talksasa.com/api/v3/
+      - key: OTP_HASH_SECRET
+        sync: false
+        sync: false
+      - key: WEB_ORIGIN
+        value: https://portal.bingwasokoni.top
+      - key: PORT
+        value: 4000
