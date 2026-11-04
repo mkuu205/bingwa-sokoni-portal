@@ -8,12 +8,14 @@ import { env } from "./env.js";
 import { prisma } from "./db.js";
 import { deviceSyncRouter } from "./device-sync.js";
 import { adminRouter } from "./admin.js";
-import { AuthRequest, hashPairingCode, issueAdminToken, issueUserToken, randomSecret, requireAuth, sha256 } from "./security.js";
+import { clearRefreshCookieHeader, previousRefreshTokenInGrace, readRefreshCookie, refreshCookieHeader, sessionLifetime } from "./auth-sessions.js";
+import { paymentReplayMatches, payHeroTerminalStatus } from "./billing-logic.js";
+import { AuthRequest, hashPairingCode, issueAdminToken, issueUserToken, randomSecret, requireAuth, sha256, verifyUserToken } from "./security.js";
 
 const app = express();
 app.disable("x-powered-by");
 app.use(helmet());
-app.use(cors({ origin: env.WEB_ORIGIN, credentials: false }));
+app.use(cors({ origin: env.WEB_ORIGIN, credentials: true }));
 app.use((req: AuthRequest, res, next) => {
   req.requestId = randomUUID();
   res.setHeader("X-Request-ID", req.requestId);
@@ -31,21 +33,27 @@ app.use(/^\/api\/trpc\/deviceSync\.(pairDevice|heartbeat|pollCommands|reportComm
   deviceSyncRouter(req, res, next);
 });
 
-app.post("/api/auth/register", async (req, res) => {
-  const parsed = z.object({ phone: z.string().regex(/^\+?[0-9]{9,15}$/), password: z.string().min(10).max(128) }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.flatten() });
-  const phone = normalizeAuthPhone(parsed.data.phone);
-  if (!phone) return res.status(400).json({ error: "INVALID_PHONE" });
-  if (await prisma.user.findUnique({ where: { phone } })) return res.status(409).json({ error: "PHONE_ALREADY_REGISTERED" });
-  const user = await prisma.user.create({ data: { phone, passwordHash: await bcrypt.hash(parsed.data.password, 12) } });
-  try { await createAndSendOtp(phone, user.id, "LOGIN"); }
-  catch (e: any) {
-    await prisma.user.delete({ where: { id: user.id } });
-    return res.status(503).json({ error: e?.message === "TALKSASA_NOT_CONFIGURED" ? "OTP_PROVIDER_NOT_CONFIGURED" : "OTP_DELIVERY_FAILED" });
-  }
-  return res.status(201).json({ requiresOtp: true, phone: `${phone.slice(0, 5)}••••${phone.slice(-2)}`, message: "A verification code has been sent." });
-});
-
+function writeRefreshCookie(res: express.Response, secret: string, expiresAt: Date) {
+  const age = Math.floor((expiresAt.getTime() - Date.now()) / 1000);
+  res.setHeader("Set-Cookie", refreshCookieHeader(secret, age, env.NODE_ENV === "production"));
+}
+function clearSessionCookie(res: express.Response) {
+  res.setHeader("Set-Cookie", clearRefreshCookieHeader(env.NODE_ENV === "production"));
+}
+async function createUserSession(user: { id: string; phone: string; role: string }, res: express.Response, legacyTokenHash?: string) {
+  const secret = randomSecret(48);
+  const expiresAt = new Date(Date.now() + sessionLifetime("user"));
+  const session = await prisma.webSession.create({ data: { tokenType: "user", userId: user.id, refreshTokenHash: sha256(secret), legacyTokenHash, expiresAt } });
+  writeRefreshCookie(res, secret, expiresAt);
+  return { user: { id: user.id, phone: user.phone, role: user.role }, token: issueUserToken(user, session.id) };
+}
+async function createAdminSession(username: string, res: express.Response, legacyTokenHash?: string) {
+  const secret = randomSecret(48);
+  const expiresAt = new Date(Date.now() + sessionLifetime("admin"));
+  const session = await prisma.webSession.create({ data: { tokenType: "admin", adminUsername: username, refreshTokenHash: sha256(secret), legacyTokenHash, expiresAt } });
+  writeRefreshCookie(res, secret, expiresAt);
+  return { user: { username, role: "ADMIN" }, token: issueAdminToken(username, session.id) };
+}
 function normalizeAuthPhone(value: string): string | null {
   const digits = value.replace(/[\s()+-]/g, "");
   if (/^0[17]\d{8}$/.test(digits)) return `254${digits.slice(1)}`;
@@ -56,11 +64,10 @@ function normalizeAuthPhone(value: string): string | null {
 function otpDigest(code: string, phone: string, purpose: string) {
   return sha256(`${env.OTP_HASH_SECRET || env.PAIRING_CODE_PEPPER}:${phone}:${purpose}:${code}`);
 }
-async function sendTalkSasaOtp(phone: string, code: string, purpose: "LOGIN" | "PASSWORD_RESET") {
+async function sendTalkSasaOtp(phone: string, code: string, purpose: "LOGIN" | "REGISTRATION" | "PASSWORD_RESET" | "PHONE_CHANGE") {
   if (!env.TALKSASA_API_KEY || !env.TALKSASA_SENDER_ID) throw new Error("TALKSASA_NOT_CONFIGURED");
-  const message = purpose === "LOGIN"
-    ? `Bingwa Sokoni login code: ${code}. Expires in 5 minutes. Do not share this code.`
-    : `Bingwa Sokoni password reset code: ${code}. Expires in 5 minutes. Do not share this code.`;
+  const label = purpose === "PASSWORD_RESET" ? "password reset" : purpose === "PHONE_CHANGE" ? "phone change" : purpose === "REGISTRATION" ? "phone verification" : "login";
+  const message = `Bingwa Sokoni ${label} code: ${code}. Expires in 5 minutes. Do not share this code.`;
   const base = env.TALKSASA_API_URL.endsWith("/") ? env.TALKSASA_API_URL : `${env.TALKSASA_API_URL}/`;
   const response = await fetch(new URL("sms/send", base), {
     method: "POST",
@@ -68,11 +75,9 @@ async function sendTalkSasaOtp(phone: string, code: string, purpose: "LOGIN" | "
     body: JSON.stringify({ recipient: `+${phone}`, sender_id: env.TALKSASA_SENDER_ID, type: "plain", message })
   });
   const data: any = await response.json().catch(() => ({}));
-  if (!response.ok || data?.status === false || data?.success === false) {
-    throw new Error(`TALKSASA_SEND_FAILED_${response.status}`);
-  }
+  if (!response.ok || data?.status === false || data?.success === false) throw new Error(`TALKSASA_SEND_FAILED_${response.status}`);
 }
-async function createAndSendOtp(phone: string, userId: string | null, purpose: "LOGIN" | "PASSWORD_RESET") {
+async function createAndSendOtp(phone: string, userId: string | null, purpose: "LOGIN" | "REGISTRATION" | "PASSWORD_RESET" | "PHONE_CHANGE") {
   const recent = await prisma.otpChallenge.findFirst({ where: { phone, purpose, createdAt: { gt: new Date(Date.now() - 60_000) } }, orderBy: { createdAt: "desc" } });
   if (recent) throw new Error("OTP_COOLDOWN");
   const code = String(randomInt(100000, 1000000));
@@ -80,6 +85,138 @@ async function createAndSendOtp(phone: string, userId: string | null, purpose: "
   try { await sendTalkSasaOtp(phone, code, purpose); }
   catch (error) { await prisma.otpChallenge.delete({ where: { id: challenge.id } }); throw error; }
 }
+
+app.post("/api/auth/refresh", async (req, res) => {
+  const origin = req.header("origin");
+  if (origin && origin !== env.WEB_ORIGIN) return res.status(403).json({ error: "INVALID_ORIGIN" });
+  const secret = readRefreshCookie(req.header("cookie"));
+  if (!secret) {
+    // One-time compatibility upgrade for still-valid access tokens issued before refresh sessions existed.
+    const legacyToken = req.header("authorization")?.replace(/^Bearer\s+/i, "");
+    if (legacyToken) {
+      try {
+        const payload = verifyUserToken(legacyToken);
+        const legacyTokenHash = sha256(legacyToken);
+        if (payload.sid || await prisma.webSession.findUnique({ where: { legacyTokenHash }, select: { id: true } })) {
+          clearSessionCookie(res); return res.status(401).json({ error: "SESSION_EXPIRED" });
+        }
+        if (!payload.sid && payload.typ === "user" && payload.sub) {
+          const user = await prisma.user.findUnique({ where: { id: payload.sub }, select: { id: true, phone: true, role: true, suspendedAt: true, phoneVerifiedAt: true } });
+          if (user && !user.suspendedAt && user.phoneVerifiedAt && user.role === payload.role) return res.json(await createUserSession(user, res, legacyTokenHash));
+        }
+        if (!payload.sid && payload.typ === "admin" && payload.sub === env.ADMIN_USERNAME && payload.role === "ADMIN" && env.ADMIN_PASSWORD_HASH) return res.json(await createAdminSession(payload.sub, res, legacyTokenHash));
+      } catch { /* Expired or invalid legacy credentials are not upgraded. */ }
+    }
+    clearSessionCookie(res); return res.status(401).json({ error: "SESSION_EXPIRED" });
+  }
+  const now = new Date(); const submittedHash = sha256(secret);
+  const session = await prisma.webSession.findFirst({ where: { OR: [{ refreshTokenHash: submittedHash }, { previousTokenHash: submittedHash }] } });
+  if (!session || session.revokedAt || session.expiresAt <= now) { clearSessionCookie(res); return res.status(401).json({ error: "SESSION_EXPIRED" }); }
+  const isCurrentToken = session.refreshTokenHash === submittedHash;
+  if (!isCurrentToken && !(session.previousTokenHash === submittedHash && previousRefreshTokenInGrace(session.previousTokenAt, now.getTime()))) {
+    clearSessionCookie(res); return res.status(401).json({ error: "SESSION_EXPIRED" });
+  }
+  let user: { id: string; phone: string; role: string } | null = null;
+  if (session.tokenType === "user") {
+    user = session.userId ? await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, phone: true, role: true, suspendedAt: true, phoneVerifiedAt: true } }) as any : null;
+    if (!user || (user as any).suspendedAt || !(user as any).phoneVerifiedAt) {
+      await prisma.webSession.update({ where: { id: session.id }, data: { revokedAt: now } }); clearSessionCookie(res);
+      return res.status(403).json({ error: "ACCOUNT_UNAVAILABLE" });
+    }
+  } else if (session.tokenType !== "admin" || session.adminUsername !== env.ADMIN_USERNAME || !env.ADMIN_PASSWORD_HASH) {
+    await prisma.webSession.update({ where: { id: session.id }, data: { revokedAt: now } }); clearSessionCookie(res);
+    return res.status(401).json({ error: "SESSION_EXPIRED" });
+  }
+
+  const nextSecret = randomSecret(48); const nextHash = sha256(nextSecret);
+  const where: any = { id: session.id, refreshTokenHash: session.refreshTokenHash, revokedAt: null, expiresAt: { gt: now } };
+  if (!isCurrentToken) { where.previousTokenHash = submittedHash; where.previousTokenAt = session.previousTokenAt; }
+  const rotated = await prisma.webSession.updateMany({
+    where,
+    data: { previousTokenHash: session.refreshTokenHash, previousTokenAt: now, refreshTokenHash: nextHash, lastUsedAt: now }
+  });
+  if (!rotated.count) return res.status(409).json({ error: "REFRESH_RACE_RETRY" });
+  writeRefreshCookie(res, nextSecret, session.expiresAt);
+  if (user) return res.json({ token: issueUserToken(user, session.id), user: { id: user.id, phone: user.phone, role: user.role } });
+  return res.json({ token: issueAdminToken(session.adminUsername!, session.id), user: { username: session.adminUsername, role: "ADMIN" } });
+});
+
+app.post("/api/auth/logout", async (req, res) => {
+  const origin = req.header("origin");
+  if (origin && origin !== env.WEB_ORIGIN) return res.status(403).json({ error: "INVALID_ORIGIN" });
+  const now = new Date();
+  const secret = readRefreshCookie(req.header("cookie"));
+  if (secret) {
+    const hash = sha256(secret);
+    await prisma.webSession.updateMany({ where: { revokedAt: null, OR: [{ refreshTokenHash: hash }, { previousTokenHash: hash }] }, data: { revokedAt: now } });
+  }
+  const bearer = req.header("authorization")?.replace(/^Bearer\s+/i, "");
+  if (bearer) {
+    try {
+      const payload = verifyUserToken(bearer);
+      if (payload.sid) await prisma.webSession.updateMany({ where: { id: payload.sid, revokedAt: null }, data: { revokedAt: now } });
+    } catch { /* An invalid/expired access token does not prevent cookie clearing. */ }
+  }
+  clearSessionCookie(res);
+  return res.json({ ok: true });
+});
+
+app.post("/api/auth/register", async (req, res) => {
+  const parsed = z.object({ phone: z.string().regex(/^\+?[0-9]{9,15}$/), password: z.string().min(10).max(128) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.flatten() });
+  const phone = normalizeAuthPhone(parsed.data.phone);
+  if (!phone) return res.status(400).json({ error: "INVALID_PHONE" });
+  const existingUser = await prisma.user.findUnique({ where: { phone } });
+  if (existingUser) {
+    if (existingUser.phoneVerifiedAt) return res.status(409).json({ error: "PHONE_ALREADY_REGISTERED" });
+    if (existingUser.suspendedAt) return res.status(403).json({ error: "ACCOUNT_SUSPENDED" });
+    if (!(await bcrypt.compare(parsed.data.password, existingUser.passwordHash))) return res.status(409).json({ error: "PHONE_ALREADY_REGISTERED" });
+    try {
+      await createAndSendOtp(phone, existingUser.id, "REGISTRATION");
+      return res.status(200).json({ requiresOtp: true, phone: `${phone.slice(0, 5)}••••${phone.slice(-2)}`, message: "A verification code has been sent." });
+    } catch (error: any) {
+      if (error?.message === "OTP_COOLDOWN") return res.status(429).json({ error: "OTP_COOLDOWN", message: "Please wait before requesting another code." });
+      return res.status(503).json({ error: error?.message === "TALKSASA_NOT_CONFIGURED" ? "OTP_PROVIDER_NOT_CONFIGURED" : "OTP_DELIVERY_FAILED" });
+    }
+  }
+  const user = await prisma.user.create({ data: { phone, passwordHash: await bcrypt.hash(parsed.data.password, 12) } });
+  try { await createAndSendOtp(phone, user.id, "REGISTRATION"); }
+  catch (e: any) {
+    await prisma.user.delete({ where: { id: user.id } });
+    if (e?.message === "OTP_COOLDOWN") return res.status(429).json({ error: "OTP_COOLDOWN", message: "Please wait before requesting another code." });
+    return res.status(503).json({ error: e?.message === "TALKSASA_NOT_CONFIGURED" ? "OTP_PROVIDER_NOT_CONFIGURED" : "OTP_DELIVERY_FAILED" });
+  }
+  return res.status(201).json({ requiresOtp: true, phone: `${phone.slice(0, 5)}••••${phone.slice(-2)}`, message: "A verification code has been sent." });
+});
+app.post("/api/auth/register/verify", async (req, res) => {
+  const parsed = z.object({ phone: z.string().min(9).max(16), code: z.string().regex(/^\d{6}$/) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
+  const phone = normalizeAuthPhone(parsed.data.phone);
+  if (!phone) return res.status(400).json({ error: "INVALID_PHONE" });
+  const user = await prisma.user.findUnique({ where: { phone } });
+  if (!user || user.suspendedAt) return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
+  if (user.phoneVerifiedAt) return res.status(409).json({ error: "PHONE_ALREADY_VERIFIED", message: "Sign in with your phone number and password." });
+  let challenge = await prisma.otpChallenge.findFirst({ where: { phone, userId: user.id, purpose: "REGISTRATION", consumedAt: null, expiresAt: { gt: new Date() } }, orderBy: { createdAt: "desc" } });
+  // Allow users already midway through registration to finish challenges issued by the prior LOGIN-purpose flow.
+  if (!challenge) challenge = await prisma.otpChallenge.findFirst({ where: { phone, userId: user.id, purpose: "LOGIN", consumedAt: null, expiresAt: { gt: new Date() } }, orderBy: { createdAt: "desc" } });
+  if (!challenge || challenge.attempts >= 5) return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
+  const purpose = challenge.purpose;
+  if (challenge.codeHash !== otpDigest(parsed.data.code, phone, purpose)) {
+    await prisma.otpChallenge.updateMany({ where: { id: challenge.id, consumedAt: null }, data: { attempts: { increment: 1 } } });
+    return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
+  }
+  const now = new Date();
+  const verified = await prisma.$transaction(async tx => {
+    const consumed = await tx.otpChallenge.updateMany({ where: { id: challenge!.id, consumedAt: null, attempts: { lt: 5 }, expiresAt: { gt: now } }, data: { consumedAt: now } });
+    if (consumed.count !== 1) return false;
+    const changed = await tx.user.updateMany({ where: { id: user.id, phoneVerifiedAt: null }, data: { phoneVerifiedAt: now } });
+    return changed.count === 1;
+  });
+  if (!verified) return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
+  const verifiedUser = await prisma.user.findUnique({ where: { id: user.id }, select: { id: true, phone: true, role: true } });
+  if (!verifiedUser) return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
+  return res.json(await createUserSession(verifiedUser, res));
+});
 app.post("/api/auth/login", async (req, res) => {
   const parsed = z.object({ phone: z.string().min(9).max(16), password: z.string().min(1).max(128) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
@@ -88,28 +225,8 @@ app.post("/api/auth/login", async (req, res) => {
   const user = await prisma.user.findUnique({ where: { phone } });
   if (!user || !(await bcrypt.compare(parsed.data.password, user.passwordHash))) return res.status(401).json({ error: "INVALID_CREDENTIALS" });
   if (user.suspendedAt) return res.status(403).json({ error: "ACCOUNT_SUSPENDED" });
-  try { await createAndSendOtp(phone, user.id, "LOGIN"); }
-  catch (e: any) {
-    if (e?.message === "OTP_COOLDOWN") return res.status(429).json({ error: "OTP_COOLDOWN", message: "Please wait before requesting another code." });
-    return res.status(503).json({ error: e?.message === "TALKSASA_NOT_CONFIGURED" ? "OTP_PROVIDER_NOT_CONFIGURED" : "OTP_DELIVERY_FAILED" });
-  }
-  return res.json({ requiresOtp: true, phone: `${phone.slice(0, 5)}••••${phone.slice(-2)}`, message: "A verification code has been sent." });
-});
-app.post("/api/auth/login/verify", async (req, res) => {
-  const parsed = z.object({ phone: z.string().min(9).max(16), code: z.string().regex(/^\d{6}$/) }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
-  const phone = normalizeAuthPhone(parsed.data.phone);
-  if (!phone) return res.status(400).json({ error: "INVALID_PHONE" });
-  const challenge = await prisma.otpChallenge.findFirst({ where: { phone, purpose: "LOGIN", consumedAt: null, expiresAt: { gt: new Date() } }, orderBy: { createdAt: "desc" } });
-  if (!challenge || challenge.attempts >= 5) return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
-  if (challenge.codeHash !== otpDigest(parsed.data.code, phone, "LOGIN")) {
-    await prisma.otpChallenge.update({ where: { id: challenge.id }, data: { attempts: { increment: 1 } } });
-    return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
-  }
-  const user = await prisma.user.findUnique({ where: { id: challenge.userId || "" } });
-  if (!user || user.suspendedAt) return res.status(403).json({ error: "ACCOUNT_UNAVAILABLE" });
-  await prisma.$transaction([prisma.otpChallenge.update({ where: { id: challenge.id }, data: { consumedAt: new Date() } }), prisma.user.update({ where: { id: user.id }, data: { phoneVerifiedAt: user.phoneVerifiedAt ?? new Date() } })]);
-  return res.json({ user: { id: user.id, phone: user.phone, role: user.role, phoneVerified: true }, token: issueUserToken(user) });
+  if (!user.phoneVerifiedAt) return res.status(403).json({ error: "PHONE_NOT_VERIFIED", message: "Complete registration phone verification before signing in." });
+  return res.json(await createUserSession(user, res));
 });
 app.post("/api/auth/password/forgot", async (req, res) => {
   const parsed = z.object({ phone: z.string().min(9).max(16) }).safeParse(req.body);
@@ -138,8 +255,53 @@ app.post("/api/auth/password/reset", async (req, res) => {
     return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
   }
   if (!challenge.userId) return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
-  await prisma.$transaction([prisma.user.update({ where: { id: challenge.userId }, data: { passwordHash: await bcrypt.hash(parsed.data.newPassword, 12) } }), prisma.otpChallenge.update({ where: { id: challenge.id }, data: { consumedAt: new Date() } }), prisma.otpChallenge.updateMany({ where: { userId: challenge.userId, consumedAt: null }, data: { consumedAt: new Date() } })]);
+  const resetAt = new Date();
+  await prisma.$transaction([prisma.user.update({ where: { id: challenge.userId }, data: { passwordHash: await bcrypt.hash(parsed.data.newPassword, 12) } }), prisma.otpChallenge.update({ where: { id: challenge.id }, data: { consumedAt: resetAt } }), prisma.otpChallenge.updateMany({ where: { userId: challenge.userId, consumedAt: null }, data: { consumedAt: resetAt } }), prisma.webSession.updateMany({ where: { userId: challenge.userId, revokedAt: null }, data: { revokedAt: resetAt } })]);
   return res.json({ ok: true, message: "Password reset successfully. Please sign in again." });
+});
+
+app.post("/api/auth/phone/change/request", requireAuth, async (req: AuthRequest, res) => {
+  const parsed = z.object({ phone: z.string().min(9).max(16) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
+  const phone = normalizeAuthPhone(parsed.data.phone);
+  if (!phone) return res.status(400).json({ error: "INVALID_PHONE" });
+  if (await prisma.user.findUnique({ where: { phone } })) return res.status(409).json({ error: "PHONE_ALREADY_REGISTERED" });
+  try {
+    await createAndSendOtp(phone, req.auth!.userId, "PHONE_CHANGE");
+    return res.json({ ok: true, message: "A phone-change verification code has been sent." });
+  } catch (error: any) {
+    if (error?.message === "OTP_COOLDOWN") return res.status(429).json({ error: "OTP_COOLDOWN", message: "Please wait before requesting another code." });
+    return res.status(503).json({ error: error?.message === "TALKSASA_NOT_CONFIGURED" ? "OTP_PROVIDER_NOT_CONFIGURED" : "OTP_DELIVERY_FAILED" });
+  }
+});
+app.post("/api/auth/phone/change/verify", requireAuth, async (req: AuthRequest, res) => {
+  const parsed = z.object({ phone: z.string().min(9).max(16), code: z.string().regex(/^\d{6}$/) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
+  const phone = normalizeAuthPhone(parsed.data.phone);
+  if (!phone) return res.status(400).json({ error: "INVALID_PHONE" });
+  const user = await prisma.user.findUnique({ where: { id: req.auth!.userId }, select: { id: true, phone: true } });
+  if (!user) return res.status(401).json({ error: "INVALID_TOKEN" });
+  if (await prisma.user.findUnique({ where: { phone } })) return res.status(409).json({ error: "PHONE_ALREADY_REGISTERED" });
+  const challenge = await prisma.otpChallenge.findFirst({ where: { phone, userId: user.id, purpose: "PHONE_CHANGE", consumedAt: null, expiresAt: { gt: new Date() } }, orderBy: { createdAt: "desc" } });
+  if (!challenge || challenge.attempts >= 5) return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
+  if (challenge.codeHash !== otpDigest(parsed.data.code, phone, "PHONE_CHANGE")) {
+    await prisma.otpChallenge.updateMany({ where: { id: challenge.id, consumedAt: null }, data: { attempts: { increment: 1 } } });
+    return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
+  }
+  const now = new Date();
+  try {
+    const changed = await prisma.$transaction(async tx => {
+      const consumed = await tx.otpChallenge.updateMany({ where: { id: challenge.id, consumedAt: null, attempts: { lt: 5 }, expiresAt: { gt: now } }, data: { consumedAt: now } });
+      if (consumed.count !== 1) return false;
+      const updated = await tx.user.updateMany({ where: { id: user.id, phone: user.phone }, data: { phone, phoneVerifiedAt: now } });
+      return updated.count === 1;
+    });
+    if (!changed) return res.status(400).json({ error: "OTP_INVALID_OR_EXPIRED" });
+    return res.json({ ok: true, phone });
+  } catch (error: any) {
+    if (error?.code === "P2002") return res.status(409).json({ error: "PHONE_ALREADY_REGISTERED" });
+    throw error;
+  }
 });
 
 app.post("/api/auth/admin/login", async (req, res) => {
@@ -148,7 +310,7 @@ app.post("/api/auth/admin/login", async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
   const passwordMatches = await bcrypt.compare(parsed.data.password, env.ADMIN_PASSWORD_HASH);
   if (parsed.data.username !== env.ADMIN_USERNAME || !passwordMatches) return res.status(401).json({ error: "INVALID_CREDENTIALS" });
-  return res.json({ user: { username: env.ADMIN_USERNAME, role: "ADMIN" }, token: issueAdminToken(env.ADMIN_USERNAME) });
+  return res.json(await createAdminSession(env.ADMIN_USERNAME, res));
 });
 
 app.get("/api/me", requireAuth, async (req: AuthRequest, res) => {
@@ -313,7 +475,8 @@ async function payHeroRequest(path: string, init: RequestInit = {}) {
   if (!authorization || !env.PAYHERO_CHANNEL_ID) throw new Error("PAYHERO_NOT_CONFIGURED");
   const response = await fetch(`https://backend.payhero.co.ke/api/v2${path}`, {
     ...init,
-    headers: { Authorization: authorization, "Content-Type": "application/json", ...(init.headers ?? {}) }
+    headers: { Authorization: authorization, "Content-Type": "application/json", ...(init.headers ?? {}) },
+    signal: init.signal ?? AbortSignal.timeout(15_000)
   });
   const data: any = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -324,15 +487,23 @@ async function payHeroRequest(path: string, init: RequestInit = {}) {
   }
   return data;
 }
-async function initiatePayHeroPayment(userId: string, phoneInput: string, amountKes: number, purpose: string, details: Record<string, unknown>) {
+async function initiatePayHeroPayment(userId: string, phoneInput: string, amountKes: number, purpose: string, details: Record<string, unknown>, idempotencyKey: string) {
   if (!env.PAYHERO_CALLBACK_URL) throw new Error("PAYHERO_CALLBACK_URL_NOT_CONFIGURED");
   const phone = normalizeKenyanPhone(phoneInput);
   if (!phone) throw new Error("INVALID_KENYAN_PHONE");
   const externalReference = `BSP-${randomUUID()}`;
-  const payment = await prisma.payment.create({
-    data: { userId, provider: "PAYHERO", externalReference, purpose, amountKes, status: "PENDING",
-      providerPayload: { phone, details } as any }
-  });
+  let payment;
+  try {
+    payment = await prisma.payment.create({
+      data: { userId, provider: "PAYHERO", externalReference, purpose, amountKes, status: "PENDING", idempotencyKey,
+        providerPayload: { phone, details } as any }
+    });
+  } catch (error: any) {
+    if (error?.code !== "P2002") throw error;
+    const existing = await prisma.payment.findUnique({ where: { idempotencyKey } });
+    if (!existing || !paymentReplayMatches(existing, { userId, purpose, amountKes })) throw new Error("IDEMPOTENCY_KEY_CONFLICT");
+    return { paymentId: existing.id, externalReference: existing.externalReference, status: existing.status, createdAt: existing.createdAt.toISOString(), replayed: true };
+  }
   try {
     const result: any = await payHeroRequest("/payments", {
       method: "POST",
@@ -347,7 +518,7 @@ async function initiatePayHeroPayment(userId: string, phoneInput: string, amount
       where: { id: payment.id },
       data: { providerReference, checkoutRequestId, providerPayload: { phone, details, initiation: result } as any }
     });
-    return { paymentId: payment.id, externalReference, status: "PENDING", providerStatus: String(result.status ?? "QUEUED") };
+    return { paymentId: payment.id, externalReference, status: "PENDING", createdAt: payment.createdAt.toISOString(), providerStatus: String(result.status ?? "QUEUED"), replayed: false };
   } catch (error) {
     await prisma.payment.update({ where: { id: payment.id }, data: { status: "FAILED", providerPayload: { phone, details, initiationError: error instanceof Error ? error.message : "unknown" } as any } });
     throw error;
@@ -408,30 +579,30 @@ app.get("/api/billing/token-packages", requireAuth, (_req, res) => {
   res.json(tokenPackages().map(({ code, name, amountKes, tokens }) => ({ code, name, amountKes, tokens })));
 });
 app.post("/api/billing/subscriptions", requireAuth, async (req: AuthRequest, res) => {
-  const parsed = z.object({ planId: z.string().min(1), phoneNumber: z.string().min(9).max(20) }).safeParse(req.body);
+  const parsed = z.object({ planId: z.string().min(1), phoneNumber: z.string().min(9).max(20), idempotencyKey: z.string().trim().min(8).max(120) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
   const plan = await prisma.plan.findUnique({ where: { id: parsed.data.planId } });
   if (!plan || !plan.active) return res.status(404).json({ error: "PLAN_NOT_AVAILABLE" });
   try {
-    const result = await initiatePayHeroPayment(req.auth!.userId, parsed.data.phoneNumber, plan.priceKes, `SUBSCRIPTION:${plan.id}`, { planId: plan.id, planName: plan.name });
+    const result = await initiatePayHeroPayment(req.auth!.userId, parsed.data.phoneNumber, plan.priceKes, `SUBSCRIPTION:${plan.id}`, { planId: plan.id, planName: plan.name }, parsed.data.idempotencyKey);
     return res.status(201).json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : "PAYMENT_INITIATION_FAILED";
-    const status = message === "INVALID_KENYAN_PHONE" ? 400 : message.includes("NOT_CONFIGURED") ? 503 : 502;
+    const status = message === "INVALID_KENYAN_PHONE" ? 400 : message === "IDEMPOTENCY_KEY_CONFLICT" ? 409 : message.includes("NOT_CONFIGURED") ? 503 : 502;
     return res.status(status).json({ error: message });
   }
 });
 app.post("/api/billing/tokens", requireAuth, async (req: AuthRequest, res) => {
-  const parsed = z.object({ packageCode: z.string().min(2).max(60), phoneNumber: z.string().min(9).max(20) }).safeParse(req.body);
+  const parsed = z.object({ packageCode: z.string().min(2).max(60), phoneNumber: z.string().min(9).max(20), idempotencyKey: z.string().trim().min(8).max(120) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_INPUT" });
   const pack = tokenPackages().find(p => p.code === parsed.data.packageCode);
   if (!pack) return res.status(404).json({ error: "TOKEN_PACKAGE_NOT_AVAILABLE" });
   try {
-    const result = await initiatePayHeroPayment(req.auth!.userId, parsed.data.phoneNumber, pack.amountKes, `TOKENS:${pack.code}`, { packageCode: pack.code, tokens: pack.tokens });
+    const result = await initiatePayHeroPayment(req.auth!.userId, parsed.data.phoneNumber, pack.amountKes, `TOKENS:${pack.code}`, { packageCode: pack.code, tokens: pack.tokens }, parsed.data.idempotencyKey);
     return res.status(201).json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : "PAYMENT_INITIATION_FAILED";
-    const status = message === "INVALID_KENYAN_PHONE" ? 400 : message.includes("NOT_CONFIGURED") ? 503 : 502;
+    const status = message === "INVALID_KENYAN_PHONE" ? 400 : message === "IDEMPOTENCY_KEY_CONFLICT" ? 409 : message.includes("NOT_CONFIGURED") ? 503 : 502;
     return res.status(status).json({ error: message });
   }
 });
@@ -440,18 +611,22 @@ app.get("/api/billing/payments", requireAuth, async (req: AuthRequest, res) => {
   res.json(rows);
 });
 app.get("/api/billing/payments/:id", requireAuth, async (req: AuthRequest, res) => {
-  const payment = await prisma.payment.findFirst({ where: { id: req.params.id, userId: req.auth!.userId }, select: { id: true, externalReference: true, providerReference: true, purpose: true, amountKes: true, status: true, verifiedAt: true, createdAt: true } });
+  let payment = await prisma.payment.findFirst({ where: { id: req.params.id, userId: req.auth!.userId }, select: { id: true, externalReference: true, providerReference: true, purpose: true, amountKes: true, status: true, verifiedAt: true, createdAt: true } });
   if (!payment) return res.status(404).json({ error: "PAYMENT_NOT_FOUND" });
+  let providerStatus: string | null = null;
   if (payment.status === "PENDING" && payment.providerReference) {
     try {
       const statusData: any = await payHeroRequest(`/transaction-status?reference=${encodeURIComponent(payment.providerReference)}`, { method: "GET" });
-      if (String(statusData.status ?? "").toUpperCase() === "SUCCESS" && statusData.success !== false) {
-        // Status polling alone does not include a reliably documented amount in all responses;
-        // wait for the callback amount before applying financial effects.
+      providerStatus = String(statusData.status ?? "").toUpperCase() || null;
+      const terminalStatus: "FAILED" | "REVERSED" | null = payHeroTerminalStatus(providerStatus);
+      if (terminalStatus) {
+        await prisma.payment.updateMany({ where: { id: payment.id, status: "PENDING" }, data: { status: terminalStatus, providerPayload: { polledStatus: statusData } as any } });
+        payment = { ...payment, status: terminalStatus };
       }
     } catch { /* A transient provider error must not change payment state. */ }
   }
-  return res.json(payment);
+  // A success response is informational until the callback's amount is independently verified.
+  return res.json({ ...payment, providerStatus, awaitingVerifiedCallback: payment.status === "PENDING" && providerStatus === "SUCCESS" });
 });
 app.get("/api/billing/token-ledger", requireAuth, async (req: AuthRequest, res) => {
   const rows = await prisma.tokenLedgerEntry.findMany({ where: { userId: req.auth!.userId }, orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 100 });

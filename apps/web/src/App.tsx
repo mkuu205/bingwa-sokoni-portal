@@ -1,17 +1,18 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { Activity, ArrowDownLeft, ArrowUpRight, Bell, CheckCircle2, ChevronDown, CircleHelp, Command, CreditCard, Database, LayoutDashboard, LogOut, Menu, MonitorSmartphone, Plus, RefreshCw, Search, Settings, ShieldCheck, Smartphone, Users, Wallet, Wifi, X } from "lucide-react";
-import { ApiError, api } from "./api";
+import { ApiError, api, logoutSession, restoreSessionFromCookie } from "./api";
 import { resolveRoute } from "./route-state.js";
 import AdminPanel from "./AdminPanel";
 
 type Device = { id: string; deviceName: string; status: string; lastSeenAt?: string | null; appVersion?: string | null; model?: string | null; automationEnabled: boolean; executionState: string };
-type Me = { id: string; phone: string; role: string; tokenBalance: number; devices: Device[]; subscriptions: any[]; subscription?: any | null };
+type Me = { id: string; phone: string; role: string; phoneVerifiedAt?: string | null; tokenBalance: number; devices: Device[]; subscriptions: any[]; subscription?: any | null };
 type Tx = { id: string; phoneNumber: string; packageName: string; amountKes: string; status: string; lastSyncedAt: string; device: { deviceName: string } };
 type AdminOverview = { users: number; devices: number; pendingPayments: number; activeSubscriptions: number; queuedCommands: number };
 type BillingPlan = { id: string; code: string; name: string; priceKes: number; durationDays: number; maxDevices: number | null; transactionHistoryDays: number; active?: boolean };
 type TokenPackage = { code: string; name: string; amountKes: number; tokens: number };
 type BillingPayment = { id: string; externalReference: string; purpose: string; amountKes: number; status: string; createdAt: string; verifiedAt?: string | null };
+type TrackedPayment = { id: string; externalReference: string; purpose: string; status: string; createdAt: string; providerStatus?: string | null };
 
 const nav = [
   { label: "Overview", icon: LayoutDashboard, group: "WORKSPACE" },
@@ -45,9 +46,11 @@ export default function App() {
   const [adminUsername, setAdminUsername] = useState("kish");
   const [adminPassword, setAdminPassword] = useState("");
   const [registering, setRegistering] = useState(false);
-  const [authStep, setAuthStep] = useState<"credentials" | "login-otp" | "forgot-phone" | "reset-otp">("credentials");
+  const [authStep, setAuthStep] = useState<"credentials" | "registration-otp" | "forgot-phone" | "reset-otp">("credentials");
   const [otpCode, setOtpCode] = useState("");
   const [newPassword, setNewPassword] = useState("");
+  const [phoneChange, setPhoneChange] = useState({ phone: "", code: "", step: "idle" as "idle" | "code" });
+  const [phoneChangeNotice, setPhoneChangeNotice] = useState("");
   const [pairCode, setPairCode] = useState("");
   const [showPair, setShowPair] = useState(false);
   const [commandBusy, setCommandBusy] = useState("");
@@ -66,6 +69,12 @@ export default function App() {
   const [billingPlansLoading, setBillingPlansLoading] = useState(false);
   const [billingPlansError, setBillingPlansError] = useState("");
   const [billingPlanRetry, setBillingPlanRetry] = useState(0);
+  const restoreGeneration = useRef(0);
+  const checkoutLock = useRef(false);
+  const subscriptionIdempotency = useRef("");
+  const [billingPlanSubmitting, setBillingPlanSubmitting] = useState("");
+  const [trackedPayment, setTrackedPayment] = useState<TrackedPayment | null>(null);
+  const [paymentPollingTimedOut, setPaymentPollingTimedOut] = useState(false);
 
   function navigate(to: string, replace = false) {
     if (replace) window.history.replaceState({}, "", to);
@@ -74,8 +83,15 @@ export default function App() {
   }
 
   async function refresh() {
-    const savedToken = localStorage.getItem("bingwa_token");
+    const generation = ++restoreGeneration.current;
+    let savedToken = localStorage.getItem("bingwa_token");
     if (!savedToken) {
+      const restored = await restoreSessionFromCookie();
+      if (generation !== restoreGeneration.current) return;
+      savedToken = restored ? localStorage.getItem("bingwa_token") : null;
+    }
+    if (!savedToken) {
+      if (generation !== restoreGeneration.current) return;
       setMe(null); setAdminSession(null); setAdminOverview(null); setAuthReady(true);
       return;
     }
@@ -88,10 +104,12 @@ export default function App() {
         if (!(profileError instanceof ApiError) || profileError.status !== 401) throw profileError;
         try {
           const overview = await api<AdminOverview>("/api/admin/overview");
+          if (generation !== restoreGeneration.current) return;
           setMe(null); setAdminSession({ username: localStorage.getItem("bingwa_admin_username") || "Administrator" });
           setAdminOverview(overview); setTransactions([]); setDataPlans([]); setAuthReady(true);
           return;
         } catch (adminError) {
+          if (generation !== restoreGeneration.current) return;
           if (adminError instanceof ApiError && (adminError.status === 401 || adminError.status === 403)) {
             localStorage.removeItem("bingwa_token"); localStorage.removeItem("bingwa_admin_username");
             setMe(null); setAdminSession(null); setAdminOverview(null); setTransactions([]); setDataPlans([]);
@@ -102,6 +120,7 @@ export default function App() {
         }
       }
 
+      if (generation !== restoreGeneration.current) return;
       if (profile.role !== "USER" && profile.role !== "ADMIN") {
         localStorage.removeItem("bingwa_token"); localStorage.removeItem("bingwa_admin_username");
         setMe(null); setAdminSession(null); setAdminOverview(null); setAuthReady(true);
@@ -109,13 +128,16 @@ export default function App() {
       }
       setMe(profile); setAdminSession(null); localStorage.removeItem("bingwa_admin_username");
       if (profile.role === "ADMIN") {
-        setAdminOverview(await api<AdminOverview>("/api/admin/overview"));
+        const overview = await api<AdminOverview>("/api/admin/overview");
+        if (generation !== restoreGeneration.current) return;
+        setAdminOverview(overview);
         setTransactions([]); setDataPlans([]);
       } else {
         setAdminOverview(null);
         const [txResult, plansResult] = await Promise.allSettled([
           api<Tx[]>("/api/transactions"), api<any[]>("/api/data-plans")
         ]);
+        if (generation !== restoreGeneration.current) return;
         if (txResult.status === "fulfilled") setTransactions(txResult.value);
         if (plansResult.status === "fulfilled") setDataPlans(plansResult.value);
         const failedResult = txResult.status === "rejected" ? txResult : plansResult.status === "rejected" ? plansResult : null;
@@ -123,9 +145,10 @@ export default function App() {
       }
       setAuthReady(true);
     } catch (e) {
+      if (generation !== restoreGeneration.current) return;
       setError(e instanceof Error ? e.message : "Could not load portal data");
       setAuthReady(true);
-    } finally { setLoading(false); }
+    } finally { if (generation === restoreGeneration.current) setLoading(false); }
   }
 
   useEffect(() => {
@@ -144,6 +167,54 @@ export default function App() {
   }, [me?.id, page]);
 
   useEffect(() => {
+    if (!trackedPayment || trackedPayment.status !== "PENDING" || paymentPollingTimedOut) return;
+    let cancelled = false;
+    let timer = 0;
+    const poll = async () => {
+      if (cancelled) return;
+      if (Date.now() - new Date(trackedPayment.createdAt).getTime() >= 10 * 60_000) {
+        setBillingNotice(`Payment ${trackedPayment.externalReference} is still awaiting final confirmation. Check status below; no subscription is activated while payment remains pending.`);
+        setPaymentPollingTimedOut(true);
+        void api<BillingPayment[]>("/api/billing/payments").then(setBillingPayments).catch(() => undefined);
+        return;
+      }
+      try {
+        const payment = await api<TrackedPayment & { awaitingVerifiedCallback?: boolean }>(`/api/billing/payments/${encodeURIComponent(trackedPayment.id)}`);
+        if (cancelled) return;
+        setTrackedPayment(current => current?.id === payment.id ? { ...current, ...payment } : current);
+        if (payment.status === "SUCCESS") {
+          setBillingNotice(`Payment ${payment.externalReference} was verified successfully. Your subscription has been activated.`);
+          setTrackedPayment(null); setPaymentPollingTimedOut(false); void refresh();
+          void api<BillingPayment[]>("/api/billing/payments").then(setBillingPayments).catch(() => undefined);
+          return;
+        }
+        if (payment.status === "FAILED" || payment.status === "REVERSED") {
+          setBillingNotice(`Payment ${payment.externalReference} ${payment.status.toLowerCase()}. No subscription was activated.`);
+          setTrackedPayment(null); setPaymentPollingTimedOut(false);
+          void api<BillingPayment[]>("/api/billing/payments").then(setBillingPayments).catch(() => undefined);
+          return;
+        }
+        if (payment.awaitingVerifiedCallback) setBillingNotice(`PayHero reports success for ${payment.externalReference}; waiting for the amount-verified callback before activation.`);
+      } catch (error) {
+        if (!cancelled) setBillingNotice(error instanceof Error ? `Payment status check failed: ${error.message}. Retrying…` : "Payment status check failed. Retrying…");
+      }
+      if (!cancelled) timer = window.setTimeout(poll, 5000);
+    };
+    timer = window.setTimeout(poll, 5000);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [trackedPayment?.id, trackedPayment?.status, paymentPollingTimedOut]);
+
+  useEffect(() => {
+    const expired = () => {
+      restoreGeneration.current += 1;
+      setMe(null); setAdminSession(null); setAdminOverview(null); setTransactions([]); setDataPlans([]);
+      setAuthReady(true); setError("Your session expired. Please sign in again.");
+    };
+    window.addEventListener("bingwa:session-expired", expired);
+    return () => window.removeEventListener("bingwa:session-expired", expired);
+  }, []);
+
+  useEffect(() => {
     if (!me || !["Subscription", "Buy Tokens", "Token History"].includes(page)) return;
     let cancelled = false;
     const loadBilling = async () => {
@@ -160,7 +231,13 @@ export default function App() {
       ]);
       if (cancelled) return;
       if (packs.status === "fulfilled") setTokenPackages(packs.value);
-      if (payments.status === "fulfilled") setBillingPayments(payments.value);
+      if (payments.status === "fulfilled") {
+        setBillingPayments(payments.value);
+        const pendingSubscription = page === "Subscription" ? payments.value.find(payment => payment.purpose.startsWith("SUBSCRIPTION:") && payment.status === "PENDING") : undefined;
+        if (pendingSubscription) {
+          setTrackedPayment(current => current?.id ? current : { id: pendingSubscription.id, externalReference: pendingSubscription.externalReference, purpose: pendingSubscription.purpose, status: pendingSubscription.status, createdAt: pendingSubscription.createdAt });
+        }
+      }
       if (ledger.status === "fulfilled") setTokenLedger(ledger.value);
       const failed = [packs, payments, ledger].find(result => result.status === "rejected");
       if (failed?.status === "rejected") setBillingNotice(failed.reason instanceof Error ? failed.reason.message : "Could not load billing information");
@@ -181,7 +258,7 @@ export default function App() {
       const result = await api<any>(registering ? "/api/auth/register" : "/api/auth/login", {
         method: "POST", body: JSON.stringify({ phone: loginPhone, password: loginPassword })
       });
-      if (result.requiresOtp) { setAuthStep("login-otp"); setError(""); return; }
+      if (result.requiresOtp) { setAuthStep("registration-otp"); setError(""); return; }
       localStorage.setItem("bingwa_token", result.token);
       localStorage.removeItem("bingwa_admin_username");
       setAuthReady(false); navigate(result.user?.role === "ADMIN" ? "/admin" : "/");
@@ -190,10 +267,10 @@ export default function App() {
   }
 
 
-  async function verifyLoginOtp(event: FormEvent<HTMLFormElement>) {
+  async function verifyRegistrationOtp(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError("");
     try {
-      const result = await api<any>("/api/auth/login/verify", { method: "POST", body: JSON.stringify({ phone: loginPhone, code: otpCode }) });
+      const result = await api<any>("/api/auth/register/verify", { method: "POST", body: JSON.stringify({ phone: loginPhone, code: otpCode }) });
       localStorage.setItem("bingwa_token", result.token); localStorage.removeItem("bingwa_admin_username");
       setAuthStep("credentials"); setOtpCode(""); setAuthReady(false); navigate("/"); await refresh();
     } catch (e) { setError(e instanceof Error ? e.message : "Verification failed"); }
@@ -209,6 +286,20 @@ export default function App() {
       await api("/api/auth/password/reset", { method: "POST", body: JSON.stringify({ phone: loginPhone, code: otpCode, newPassword }) });
       setAuthStep("credentials"); setOtpCode(""); setNewPassword(""); setLoginPassword(""); setError("Password updated. Sign in with your new password.");
     } catch (e) { setError(e instanceof Error ? e.message : "Password reset failed"); }
+  }
+  async function requestPhoneChange(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setPhoneChangeNotice("");
+    try {
+      const result = await api<{ message: string }>("/api/auth/phone/change/request", { method: "POST", body: JSON.stringify({ phone: phoneChange.phone }) });
+      setPhoneChange(v => ({ ...v, step: "code" })); setPhoneChangeNotice(result.message);
+    } catch (e) { setPhoneChangeNotice(e instanceof Error ? e.message : "Could not send phone verification code"); }
+  }
+  async function verifyPhoneChange(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setPhoneChangeNotice("");
+    try {
+      await api("/api/auth/phone/change/verify", { method: "POST", body: JSON.stringify({ phone: phoneChange.phone, code: phoneChange.code }) });
+      setPhoneChange({ phone: "", code: "", step: "idle" }); setPhoneChangeNotice("Phone number verified and updated."); await refresh();
+    } catch (e) { setPhoneChangeNotice(e instanceof Error ? e.message : "Phone verification failed"); }
   }
   async function adminAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setError("");
@@ -244,25 +335,60 @@ export default function App() {
   }
 
   async function purchaseSubscription(planId: string) {
-    setBillingBusy(true); setBillingNotice("");
+    if (checkoutLock.current || trackedPayment?.status === "PENDING") return;
+    checkoutLock.current = true; setBillingBusy(true); setBillingPlanSubmitting(planId); setBillingNotice("");
+    const requestIdentity = JSON.stringify({ userId: me?.id, planId, phoneNumber: billingPhone || me?.phone || "" });
+    let storedAttempt: { identity?: string; key?: string } = {};
+    try { storedAttempt = JSON.parse(sessionStorage.getItem("bingwa_subscription_attempt") || "{}"); } catch { storedAttempt = {}; }
+    if (!subscriptionIdempotency.current) {
+      subscriptionIdempotency.current = storedAttempt.identity === requestIdentity && storedAttempt.key ? storedAttempt.key : crypto.randomUUID();
+      sessionStorage.setItem("bingwa_subscription_attempt", JSON.stringify({ identity: requestIdentity, key: subscriptionIdempotency.current }));
+    }
+    const idempotencyKey = subscriptionIdempotency.current;
     try {
-      const result = await api<{ paymentId: string; externalReference: string; status: string }>("/api/billing/subscriptions", { method: "POST", body: JSON.stringify({ planId, phoneNumber: billingPhone || me?.phone || "" }) });
-      setBillingNotice(`M-Pesa STK Push requested. Check the phone. Reference: ${result.externalReference}. Subscription activates only after verified payment.`);
-      const payments = await api<BillingPayment[]>("/api/billing/payments"); setBillingPayments(payments);
-    } catch (e) { setBillingNotice(e instanceof Error ? e.message : "Could not initiate payment"); }
-    finally { setBillingBusy(false); }
+      const result = await api<{ paymentId: string; externalReference: string; status: string; createdAt?: string; replayed?: boolean }>("/api/billing/subscriptions", {
+        method: "POST", body: JSON.stringify({ planId, phoneNumber: billingPhone || me?.phone || "", idempotencyKey })
+      });
+      subscriptionIdempotency.current = "";
+      sessionStorage.removeItem("bingwa_subscription_attempt");
+      if (result.status !== "PENDING") {
+        setTrackedPayment(null); setPaymentPollingTimedOut(false);
+        setBillingNotice(`This payment attempt already has status ${result.status}. No new STK Push was started. Refresh payment history or start a new attempt if it failed.`);
+        void api<BillingPayment[]>("/api/billing/payments").then(setBillingPayments).catch(() => undefined);
+        if (result.status === "SUCCESS") void refresh();
+        return;
+      }
+      const payment: TrackedPayment = { id: result.paymentId, externalReference: result.externalReference, purpose: `SUBSCRIPTION:${planId}`, status: result.status, createdAt: result.createdAt ?? new Date().toISOString() };
+      setTrackedPayment(payment); setPaymentPollingTimedOut(false);
+      setBillingNotice(`STK Push ${result.replayed ? "is already in progress" : "sent"}. Approve it on your phone. Payment remains pending until PayHero verifies it.`);
+      void api<BillingPayment[]>("/api/billing/payments").then(setBillingPayments).catch(() => undefined);
+    } catch (e) {
+      if (e instanceof ApiError && e.status !== 408) {
+        subscriptionIdempotency.current = "";
+        sessionStorage.removeItem("bingwa_subscription_attempt");
+      }
+      setBillingNotice(e instanceof Error ? e.message : "Could not initiate payment");
+    } finally {
+      checkoutLock.current = false; setBillingBusy(false); setBillingPlanSubmitting("");
+    }
   }
   async function purchaseTokens(packageCode: string) {
-    setBillingBusy(true); setBillingNotice("");
+    if (checkoutLock.current) return;
+    checkoutLock.current = true; setBillingBusy(true); setBillingNotice("");
+    const idempotencyKey = crypto.randomUUID();
     try {
-      const result = await api<{ paymentId: string; externalReference: string; status: string }>("/api/billing/tokens", { method: "POST", body: JSON.stringify({ packageCode, phoneNumber: billingPhone || me?.phone || "" }) });
-      setBillingNotice(`M-Pesa STK Push requested. Check the phone. Reference: ${result.externalReference}. Tokens are credited only after verified payment.`);
-      const payments = await api<BillingPayment[]>("/api/billing/payments"); setBillingPayments(payments);
+      const result = await api<{ paymentId: string; externalReference: string; status: string }>("/api/billing/tokens", {
+        method: "POST", body: JSON.stringify({ packageCode, phoneNumber: billingPhone || me?.phone || "", idempotencyKey })
+      });
+      setBillingNotice(`M-Pesa STK Push sent. Approve it on your phone. Tokens are credited only after verified PayHero payment. Reference: ${result.externalReference}.`);
+      void api<BillingPayment[]>("/api/billing/payments").then(setBillingPayments).catch(() => undefined);
     } catch (e) { setBillingNotice(e instanceof Error ? e.message : "Could not initiate payment"); }
-    finally { setBillingBusy(false); }
+    finally { checkoutLock.current = false; setBillingBusy(false); }
   }
 
   function logout() {
+    restoreGeneration.current += 1;
+    logoutSession();
     localStorage.removeItem("bingwa_token"); localStorage.removeItem("bingwa_admin_username");
     setMe(null); setAdminSession(null); setAdminOverview(null); setTransactions([]); setDataPlans([]); setAuthReady(true);
     navigate(adminSession || me?.role === "ADMIN" ? "/admin" : "/login");
@@ -286,13 +412,13 @@ export default function App() {
   if (!me) return <div className="auth-shell">
     <div className="auth-card">
       <div className="brand-mark">B</div><div className="eyebrow">BINGWA SOKONI</div>
-      <h1>{authStep === "login-otp" ? "Verify your login" : authStep === "forgot-phone" ? "Forgot password" : authStep === "reset-otp" ? "Reset password" : registering ? "Create your account" : "Welcome back"}</h1>
-      <p className="muted">{authStep === "login-otp" ? `Enter the six-digit code sent to ${loginPhone}.` : authStep === "forgot-phone" ? "Enter the phone number registered to your account." : authStep === "reset-otp" ? "Enter the recovery code and choose a new password." : "Manage your connected phones, automation and tokens in one place."}</p>
+      <h1>{authStep === "registration-otp" ? "Verify your phone" : authStep === "forgot-phone" ? "Forgot password" : authStep === "reset-otp" ? "Reset password" : registering ? "Create your account" : "Welcome back"}</h1>
+      <p className="muted">{authStep === "registration-otp" ? `Enter the six-digit code sent to ${loginPhone}.` : authStep === "forgot-phone" ? "Enter the phone number registered to your account." : authStep === "reset-otp" ? "Enter the recovery code and choose a new password." : "Manage your connected phones, automation and tokens in one place."}</p>
       {error && <div className="alert">{error}</div>}
-      {authStep === "login-otp" && <form onSubmit={verifyLoginOtp}>
-        <label>Six-digit verification code</label><input inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={otpCode} onChange={e=>setOtpCode(e.target.value.replace(/\D/g, "").slice(0,6))} required />
-        <button className="primary full" type="submit">Verify and sign in</button>
-        <button className="text-button full" type="button" onClick={()=>{setAuthStep("credentials");setOtpCode("");}}>Back to sign in</button>
+      {authStep === "registration-otp" && <form onSubmit={verifyRegistrationOtp}>
+        <label>Six-digit phone verification code</label><input inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={otpCode} onChange={e=>setOtpCode(e.target.value.replace(/\D/g, "").slice(0,6))} required />
+        <button className="primary full" type="submit">Verify phone and finish registration</button>
+        <button className="text-button full" type="button" onClick={()=>{setAuthStep("credentials");setRegistering(true);setOtpCode("");}}>Back to registration</button>
       </form>}
       {authStep === "forgot-phone" && <form onSubmit={requestPasswordReset}>
         <label>Registered phone number</label><input value={loginPhone} onChange={e=>setLoginPhone(e.target.value)} placeholder="2547XXXXXXXX" autoComplete="tel" required />
@@ -311,7 +437,7 @@ export default function App() {
         <button className="primary full" onClick={auth}>{registering ? "Create account" : "Continue"}</button>
         <button className="text-button full" onClick={()=>setRegistering(!registering)}>{registering ? "Already have an account? Sign in" : "New to Bingwa? Create an account"}</button>
       </>}
-      <div className="auth-foot"><ShieldCheck size={15}/> Login verification and password recovery via TalkSasa SMS.</div>
+      <div className="auth-foot"><ShieldCheck size={15}/> Registration and password recovery codes are delivered via TalkSasa SMS. Normal login uses your password only.</div>
     </div>
   </div>;
 
@@ -374,15 +500,15 @@ export default function App() {
           <section className="panel">
             <div className="panel-heading"><div><h3>Choose a subscription</h3><p>Pay with M-Pesa. Your subscription changes only after PayHero verification.</p></div></div>
             <label className="billing-label">M-Pesa phone number</label><input className="billing-input" value={billingPhone} onChange={e=>setBillingPhone(e.target.value)} placeholder={me.phone || "07XXXXXXXX or 2547XXXXXXXX"} />
-            {billingNotice&&<div className="notice"><ShieldCheck size={18}/><div>{billingNotice}</div></div>}
+            {billingNotice&&<div className="notice"><ShieldCheck size={18}/><div>{billingNotice}</div></div>}{trackedPayment?.status==="PENDING"&&<div className="notice" role="status"><CreditCard size={18}/><div><strong>Payment pending · {trackedPayment.externalReference}</strong><p>No subscription is active until the verified PayHero callback completes. {paymentPollingTimedOut&&<button className="secondary" onClick={()=>setPaymentPollingTimedOut(false)}>Check payment status</button>}</p></div></div>}
             {billingPlansLoading&&<div className="notice" role="status"><RefreshCw size={18}/><div>Loading available subscription plans…</div></div>}
             {billingPlansError&&<div className="alert page-alert" role="alert"><span>Could not load subscription plans: {billingPlansError}</span><button type="button" onClick={()=>setBillingPlanRetry(v=>v+1)}>Retry</button></div>}
             {!billingPlansLoading&&!billingPlansError&&billingPlans.filter(p=>p.active!==false).length===0&&<Empty title="No subscription plans are available" detail="The plan catalogue is currently empty. Refresh to try again, or contact support if the plans remain unavailable." action={<button className="secondary" onClick={()=>setBillingPlanRetry(v=>v+1)}>Retry plan loading</button>} />}
-            {!billingPlansLoading&&billingPlans.filter(p=>p.active!==false).length>0&&<div className="plan-grid">{billingPlans.filter(p=>p.active!==false).map(p=><div className={`plan-card ${activeSub?.plan?.id===p.id?"plan-current":""}`} key={p.id}><span className="plan-label">{activeSub?.plan?.id===p.id?"CURRENT PLAN":`${p.durationDays} DAYS`}</span><h3>{p.name}</h3><div className="plan-price">{money(p.priceKes)}<small>/{p.durationDays} days</small></div><p><CheckCircle2 size={15}/>{p.maxDevices==null?"Unlimited devices":`Up to ${p.maxDevices} devices`}</p><p><CheckCircle2 size={15}/>{p.transactionHistoryDays}-day transaction history</p><button className="primary full" disabled={billingBusy} onClick={()=>void purchaseSubscription(p.id)}>{billingBusy?"Requesting…":activeSub?.plan?.id===p.id?"Renew with M-Pesa":"Subscribe with M-Pesa"}</button></div>)}</div>}
+            {!billingPlansLoading&&billingPlans.filter(p=>p.active!==false).length>0&&<div className="plan-grid">{billingPlans.filter(p=>p.active!==false).map(p=><div className={`plan-card ${activeSub?.plan?.id===p.id?"plan-current":""}`} key={p.id}><span className="plan-label">{activeSub?.plan?.id===p.id?"CURRENT PLAN":`${p.durationDays} DAYS`}</span><h3>{p.name}</h3><div className="plan-price">{money(p.priceKes)}<small>/{p.durationDays} days</small></div><p><CheckCircle2 size={15}/>{p.maxDevices==null?"Unlimited devices":`Up to ${p.maxDevices} devices`}</p><p><CheckCircle2 size={15}/>{p.transactionHistoryDays}-day transaction history</p><button className="primary full" disabled={Boolean(billingPlanSubmitting)||trackedPayment?.status==="PENDING"} onClick={()=>void purchaseSubscription(p.id)}>{billingPlanSubmitting===p.id?"Requesting…":trackedPayment?.status==="PENDING"&&trackedPayment.purpose===`SUBSCRIPTION:${p.id}`?"Awaiting payment…":activeSub?.plan?.id===p.id?"Renew with M-Pesa":"Subscribe with M-Pesa"}</button></div>)}</div>}
           </section>
           <div className="notice"><CreditCard size={18}/><div><strong>Subscription renewal</strong><p>Your account remains accessible when a subscription expires, but subscription-dependent automation and remote commands must be disabled until renewal is confirmed.</p></div></div>
         </>}
-        {page==="Account Settings"&&<section className="panel"><div className="panel-heading"><div><h3>Account settings</h3><p>Profile and account security</p></div></div><div className="settings-row"><div><strong>Phone number</strong><span>{me.phone}</span></div><span className="tag pending">Verification provider required</span></div><div className="settings-row"><div><strong>Account role</strong><span>{me.role}</span></div></div><div className="settings-row"><div><strong>Security</strong><span>Password recovery and phone OTP must be configured before production.</span></div></div><button className="secondary" onClick={logout}><LogOut size={15}/> Sign out</button></section>}
+        {page==="Account Settings"&&<section className="panel"><div className="panel-heading"><div><h3>Account settings</h3><p>Profile and account security</p></div></div><div className="settings-row"><div><strong>Phone number</strong><span>{me.phone}</span></div><span className={`tag ${me.phoneVerifiedAt?"success":"pending"}`}>{me.phoneVerifiedAt?"VERIFIED":"UNVERIFIED"}</span></div>{phoneChangeNotice&&<div className="notice"><ShieldCheck size={18}/><div>{phoneChangeNotice}</div></div>}{phoneChange.step==="idle"?<form className="billing-phone-change" onSubmit={requestPhoneChange}><label className="billing-label">Change phone number</label><input className="billing-input" value={phoneChange.phone} onChange={e=>setPhoneChange(v=>({...v,phone:e.target.value}))} placeholder="07XXXXXXXX or 2547XXXXXXXX" required/><button className="secondary" type="submit">Send verification code</button></form>:<form className="billing-phone-change" onSubmit={verifyPhoneChange}><p>Enter the six-digit code sent to {phoneChange.phone}.</p><label className="billing-label">Verification code</label><input className="billing-input" inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={phoneChange.code} onChange={e=>setPhoneChange(v=>({...v,code:e.target.value.replace(/\D/g,"").slice(0,6)}))} required/><button className="primary" type="submit">Verify and update number</button><button className="text-button" type="button" onClick={()=>setPhoneChange(v=>({...v,step:"idle",code:""}))}>Use a different number</button></form>}<div className="settings-row"><div><strong>Account role</strong><span>{me.role}</span></div></div><div className="settings-row"><div><strong>Security</strong><span>Normal sign-in uses your phone number and password. OTP is used for registration, password recovery and phone changes.</span></div></div><button className="secondary" onClick={logout}><LogOut size={15}/> Sign out</button></section>}
         {page==="Admin Panel"&&<section className="panel"><div className="panel-heading"><div><h3>Administration</h3><p>Restricted account overview. Detailed management actions require separate audited endpoints.</p></div></div><Empty title="Admin overview API is ready" detail="User, subscription, device, payment, token and audit-log management screens need to be wired to role-protected admin endpoints. Separate transaction/signature monitoring pages are intentionally omitted." /></section>}
         <footer className="footer"><span>© 2026 Bingwa Sokoni Portal</span><span><i/> Secure connection architecture</span><span>{loading?"Syncing…":"Last refreshed just now"}</span></footer>
       </div>

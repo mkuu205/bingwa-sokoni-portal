@@ -53,6 +53,8 @@ enum SignatureStatus {
 enum OtpPurpose {
   LOGIN
   PASSWORD_RESET
+  REGISTRATION
+  PHONE_CHANGE
 }
 
 model User {
@@ -73,6 +75,25 @@ model User {
   signatures        ApprovedSignature[]
   auditEvents       AuditEvent[] @relation("ActorEvents")
   dataPlans          PortalDataPlan[]
+  webSessions        WebSession[]
+}
+
+model WebSession {
+  id                  String   @id @default(cuid())
+  tokenType           String
+  userId              String?
+  adminUsername       String?
+  refreshTokenHash    String   @unique
+  legacyTokenHash     String?  @unique
+  previousTokenHash   String?
+  previousTokenAt     DateTime?
+  expiresAt           DateTime
+  revokedAt           DateTime?
+  createdAt           DateTime @default(now())
+  lastUsedAt          DateTime?
+  user                User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
 }
 
 model Plan {
@@ -219,6 +240,7 @@ model Payment {
   amountKes           Int
   status              PaymentStatus @default(PENDING)
   providerPayload     Json?
+  idempotencyKey      String? @unique
   verifiedAt          DateTime?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
