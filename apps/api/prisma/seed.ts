@@ -10,7 +10,7 @@ async function main() {
     { code: "UNLIMITED", name: "Unlimited", priceKes: 350, durationDays: 30, maxDevices: null, transactionHistoryDays: 7 }
   ];
   for (const plan of plans) {
-    await prisma.plan.upsert({ where: { code: plan.code }, update: plan, create: plan });
+    await prisma.plan.upsert({ where: { code: plan.code }, update: { active: true }, create: plan });
   }
   const phone = process.env.SEED_ADMIN_PHONE;
   const password = process.env.SEED_ADMIN_PASSWORD;

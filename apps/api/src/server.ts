@@ -159,12 +159,19 @@ app.get("/api/me", requireAuth, async (req: AuthRequest, res) => {
       subscriptions: { include: { plan: true }, orderBy: { createdAt: "desc" }, take: 5 }
     }
   });
-  const ledger = await prisma.tokenLedgerEntry.findMany({ where: { userId: req.auth!.userId }, orderBy: { createdAt: "desc" }, take: 1 });
-  return res.json({ ...user, tokenBalance: ledger[0]?.balanceAfter ?? 0 });
+  const now = new Date();
+  const [ledger, activeSubscription, latestSubscription] = await Promise.all([
+    prisma.tokenLedgerEntry.findMany({ where: { userId: req.auth!.userId }, orderBy: { createdAt: "desc" }, take: 1 }),
+    prisma.subscription.findFirst({ where: { userId: req.auth!.userId, status: "ACTIVE", expiresAt: { gt: now } }, include: { plan: true }, orderBy: [{ expiresAt: "desc" }, { id: "desc" }] }),
+    prisma.subscription.findFirst({ where: { userId: req.auth!.userId }, include: { plan: true }, orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }, { id: "desc" }] })
+  ]);
+  const selected = activeSubscription ?? latestSubscription;
+  const subscription = selected ? { ...selected, status: selected.status === "ACTIVE" && selected.expiresAt && selected.expiresAt <= now ? "EXPIRED" : selected.status } : null;
+  return res.json({ ...user, subscription, tokenBalance: ledger[0]?.balanceAfter ?? 0 });
 });
 
 app.get("/api/plans", async (_req, res) => {
-  res.json(await prisma.plan.findMany({ where: { active: true }, orderBy: { priceKes: "asc" } }));
+  res.json(await prisma.plan.findMany({ where: { active: true }, orderBy: [{ priceKes: "asc" }, { code: "asc" }] }));
 });
 
 app.post("/api/devices/pairing-code", requireAuth, async (req: AuthRequest, res) => {

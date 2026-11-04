@@ -82,12 +82,33 @@ export default function AdminPanel({ username, onLogout }: { username: string; o
   const [planDrafts, setPlanDrafts] = useState<Record<string, Plan>>({});
   const [savingPlan, setSavingPlan] = useState("");
   const [activationPlans, setActivationPlans] = useState<Plan[]>([]);
+  const [activationPlansLoading, setActivationPlansLoading] = useState(false);
+  const [activationPlansError, setActivationPlansError] = useState("");
+  const [activationPlanRetry, setActivationPlanRetry] = useState(0);
   const [activationPlanId, setActivationPlanId] = useState("");
   const [activationDays, setActivationDays] = useState("");
   const [activationReason, setActivationReason] = useState("");
   const [activationKey, setActivationKey] = useState("");
   const idempotency = useRef<{ adjust: string; extend: string }>({ adjust: "", extend: "" });
   const mutationLock = useRef(false);
+
+  useEffect(() => {
+    if (detail?.kind !== "users") {
+      setActivationPlans([]); setActivationPlansError(""); setActivationPlansLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setActivationPlans([]); setActivationPlansError(""); setActivationPlansLoading(true);
+    void api<Plan[]>("/api/plans").then(plans => {
+      if (!cancelled) {
+        setActivationPlans(plans);
+        setActivationPlanId(current => plans.some(plan => plan.id === current) ? current : plans[0]?.id ?? "");
+      }
+    }).catch(e => {
+      if (!cancelled) setActivationPlansError(e instanceof Error ? e.message : "Could not load subscription plans");
+    }).finally(() => { if (!cancelled) setActivationPlansLoading(false); });
+    return () => { cancelled = true; };
+  }, [detail?.kind, detail?.id, activationPlanRetry]);
 
   const fetchOverview = useCallback(async () => {
     setOverviewLoading(true); setOverviewError("");
@@ -126,12 +147,13 @@ export default function AdminPanel({ username, onLogout }: { username: string; o
     const id = String(entity === "tokens" ? row.userId ?? row.id : row.id ?? row.targetId ?? "");
     setDetail({ kind: entity, id, row, loading: entity !== "audit-logs" });
     if (!preserveMutation) { setAdjustForm({ direction: "CREDIT", amount: "", reason: "" }); setExtendForm({ days: "", reason: "" }); setLedgerPage(1);
-      setAdjustKey(""); setExtendKey(""); idempotency.current = { adjust: "", extend: "" }; }
+      setAdjustKey(""); setExtendKey(""); idempotency.current = { adjust: "", extend: "" };
+      if (entity === "users") { setActivationPlanId(""); setActivationDays(""); setActivationReason(""); setActivationKey(""); } }
     if (entity === "audit-logs") { setDetail({ kind: entity, id, row, data: row }); return; }
     const effectiveLedgerPage = requestedLedgerPage ?? (preserveMutation ? ledgerPage : 1);
     if (entity === "tokens") setLedgerPage(effectiveLedgerPage);
     let path = entity === "tokens" ? `${listPaths.tokens}/${encodeURIComponent(id)}/ledger?page=${effectiveLedgerPage}&pageSize=10` : `${listPaths[entity]}/${encodeURIComponent(id)}`;
-    try { const data = await api<any>(path); setDetail(current => current?.id === id ? { ...current, data, loading: false } : current); if (entity === "users") { const catalog = await api<SettingsData>("/api/admin/settings"); setActivationPlans((catalog.plans ?? []).filter(plan => plan.active)); setActivationPlanId(current => current || (catalog.plans ?? []).find(plan => plan.active)?.id || ""); } }
+    try { const data = await api<any>(path); setDetail(current => current?.id === id ? { ...current, data, loading: false } : current); }
     catch (e) { setDetail(current => current?.id === id ? { ...current, loading: false, error: e instanceof Error ? e.message : "Could not load record details" } : current); }
   };
   const reloadDetail = async () => { if (detail) await openDetail(detail.kind, detail.row, true); };
@@ -156,8 +178,8 @@ export default function AdminPanel({ username, onLogout }: { username: string; o
     event.preventDefault();
     if (!detail || detail.kind !== "users" || !activationPlanId || activationReason.trim().length < 3 || mutationLock.current) return;
     if (!window.confirm(`Activate ${activationPlans.find(p => p.id === activationPlanId)?.name ?? "selected plan"} for ${detail.row.phone ?? detail.id}?`)) return;
-    if (!activationKey) setActivationKey(idempotencyKey());
     const key = activationKey || idempotencyKey();
+    setActivationKey(key);
     mutationLock.current = true; setBusy(true);
     try {
       await api(`/api/admin/users/${encodeURIComponent(detail.id)}/subscriptions/activate`, { method: "POST", body: JSON.stringify({ planId: activationPlanId, ...(activationDays.trim() ? { days: Number(activationDays) } : {}), reason: activationReason.trim(), idempotencyKey: key }) });
@@ -244,7 +266,16 @@ export default function AdminPanel({ username, onLogout }: { username: string; o
       {detail.loading && <div className="ap-state" role="status">Loading details…</div>}{detail.error && <div className="ap-state error" role="alert"><span>{detail.error}</span><button className="ap-button secondary" onClick={() => void reloadDetail()}>Retry</button></div>}
       {!detail.loading && !detail.error && <div className="ap-detail-content">
         {detail.kind === "users" ? <><SafeFields data={userRecord ?? {}} fields={detailFields.users}/>{["devices", "subscriptions", "payments", "auditEvents"].map(key => <section className="ap-detail-group" key={key}><h3>{titleCase(key)}</h3>{Array.isArray(dataForDetail?.[key]) && dataForDetail[key].length ? dataForDetail[key].map((item: any, i: number) => <div className="ap-mini-record" key={item.id ?? i}><SafeFields data={item} fields={key === "devices" ? detailFields.devices : key === "payments" ? detailFields.payments : key === "subscriptions" ? detailFields.subscriptions : detailFields["audit-logs"]}/></div>) : <p className="ap-muted">No {key} records returned.</p>}</section>)}</> : detail.kind === "tokens" ? <><SafeFields data={dataForDetail?.user ?? detail.row} fields={detailFields.tokens.filter(f => f !== "items")}/><div className="ap-detail-group"><h3>Token ledger</h3>{Array.isArray(dataForDetail?.items) && dataForDetail.items.length ? dataForDetail.items.map((item: any, i: number) => <div className="ap-mini-record" key={item.id ?? i}><SafeFields data={item} fields={["id", "delta", "balanceAfter", "reason", "reference", "createdAt"]}/></div>) : <p className="ap-muted">No ledger entries returned.</p>}{dataForDetail?.total > 10 && <div className="ap-pagination"><span>Page {dataForDetail.page} of {Math.max(1, Math.ceil(dataForDetail.total / dataForDetail.pageSize))}</span><div><button className="ap-button secondary" disabled={ledgerPage <= 1 || busy} onClick={() => void openDetail("tokens", detail.row, true, ledgerPage - 1)}>Previous</button><button className="ap-button secondary" disabled={ledgerPage * 10 >= dataForDetail.total || busy} onClick={() => void openDetail("tokens", detail.row, true, ledgerPage + 1)}>Next</button></div></div>}</div></> : <><SafeFields data={detailRecord ?? detail.row} fields={detailFields[detail.kind]}/>{detail.kind === "devices" && (dataForDetail?.owner ?? dataForDetail?.user ?? detailRecord?.owner ?? detailRecord?.user) && <section className="ap-detail-group"><h3>Owner</h3><SafeFields data={dataForDetail?.owner ?? dataForDetail?.user ?? detailRecord.owner ?? detailRecord.user} fields={["id", "phone", "role"]}/></section>}{detail.kind === "subscriptions" && (dataForDetail?.plan ?? detailRecord?.plan) && <section className="ap-detail-group"><h3>Plan</h3><SafeFields data={dataForDetail?.plan ?? detailRecord.plan} fields={["id", "code", "name", "priceKes", "durationDays", "maxDevices", "transactionHistoryDays", "active"]}/></section>}</>}
-        {detail.kind === "users" && <form className="ap-mutation" onSubmit={e => void activateUserSubscription(e)}><h3>Activate subscription</h3><label>Plan<select required value={activationPlanId} onChange={e => setActivationPlanId(e.target.value)}><option value="">Select a plan</option>{activationPlans.map(plan => <option key={plan.id} value={plan.id}>{plan.name} — KSh {plan.priceKes} / {plan.durationDays} days</option>)}</select></label>{!activationPlans.length && <p className="ap-muted">No active plans returned. The API seeds the catalogue during startup; check database connectivity and deployment logs.</p>}<label>Duration override in days (optional)<input type="number" min="1" max="3650" value={activationDays} onChange={e => setActivationDays(e.target.value)} placeholder="Use plan duration"/></label><label>Reason (required)<textarea required minLength={3} value={activationReason} onChange={e => setActivationReason(e.target.value)} placeholder="Reason for manual activation"/></label><button className="ap-button primary" disabled={busy || !activationPlanId || activationReason.trim().length < 3}>{busy ? "Activating…" : "Activate subscription"}</button></form>}
+        {detail.kind === "users" && <form className="ap-mutation" onSubmit={e => void activateUserSubscription(e)}>
+          <h3>Activate subscription</h3>
+          <label>Plan<select required value={activationPlanId} disabled={activationPlansLoading || Boolean(activationPlansError) || activationPlans.length === 0} onChange={e => setActivationPlanId(e.target.value)}><option value="">{activationPlansLoading ? "Loading plans…" : activationPlansError ? "Plans unavailable" : activationPlans.length ? "Select a plan" : "No active plans available"}</option>{activationPlans.map(plan => <option key={plan.id} value={plan.id}>{plan.name} — KSh {plan.priceKes} / {plan.durationDays} days</option>)}</select></label>
+          {activationPlansLoading && <div className="ap-state" role="status">Loading active plans from the shared catalogue…</div>}
+          {activationPlansError && <div className="ap-state error" role="alert"><span>Could not load subscription plans: {activationPlansError}</span><button type="button" className="ap-button secondary" onClick={() => setActivationPlanRetry(value => value + 1)}>Retry</button></div>}
+          {!activationPlansLoading && !activationPlansError && activationPlans.length === 0 && <p className="ap-muted">No active plans were returned. The catalogue migration runs with API startup; retry or check deployment/database status.</p>}
+          <label>Duration override in days (optional)<input type="number" min="1" max="3650" value={activationDays} onChange={e => setActivationDays(e.target.value)} placeholder="Use plan duration"/></label>
+          <label>Reason (required)<textarea required minLength={3} value={activationReason} onChange={e => setActivationReason(e.target.value)} placeholder="Reason for manual activation"/></label>
+          <button className="ap-button primary" disabled={busy || activationPlansLoading || Boolean(activationPlansError) || !activationPlanId || activationReason.trim().length < 3}>{busy ? "Activating…" : activationKey ? "Retry activation" : "Activate subscription"}</button>
+        </form>}
         {detail.kind === "users" && <div className="ap-action"><button className={`ap-button ${userRecord?.suspendedAt ? "primary" : "danger"}`} disabled={busy} onClick={() => void toggleSuspension()}>{busy ? "Working…" : userRecord?.suspendedAt ? "Reactivate account" : "Suspend account"}</button></div>}
         {detail.kind === "devices" && <div className="ap-action"><button className="ap-button danger" disabled={busy || String(detailRecord?.status ?? detail.row.status).toUpperCase() === "REVOKED"} onClick={() => void revokeDevice()}>{busy ? "Working…" : "Revoke device"}</button></div>}
         {detail.kind === "subscriptions" && <form className="ap-mutation" onSubmit={e => void extendSubscription(e)}><h3>Extend subscription</h3><label>Additional days<input type="number" min="1" step="1" required value={extendForm.days} onChange={e => setExtendForm(v => ({ ...v, days: e.target.value }))}/></label><label>Reason (required)<textarea required minLength={3} value={extendForm.reason} onChange={e => setExtendForm(v => ({ ...v, reason: e.target.value }))}/></label><button className="ap-button primary" disabled={busy || extendForm.reason.trim().length < 3}>{busy ? "Submitting…" : extendKey ? "Retry extension" : "Extend subscription"}</button></form>}

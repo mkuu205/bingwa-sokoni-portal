@@ -6,7 +6,7 @@ import { resolveRoute } from "./route-state.js";
 import AdminPanel from "./AdminPanel";
 
 type Device = { id: string; deviceName: string; status: string; lastSeenAt?: string | null; appVersion?: string | null; model?: string | null; automationEnabled: boolean; executionState: string };
-type Me = { id: string; phone: string; role: string; tokenBalance: number; devices: Device[]; subscriptions: any[] };
+type Me = { id: string; phone: string; role: string; tokenBalance: number; devices: Device[]; subscriptions: any[]; subscription?: any | null };
 type Tx = { id: string; phoneNumber: string; packageName: string; amountKes: string; status: string; lastSyncedAt: string; device: { deviceName: string } };
 type AdminOverview = { users: number; devices: number; pendingPayments: number; activeSubscriptions: number; queuedCommands: number };
 type BillingPlan = { id: string; code: string; name: string; priceKes: number; durationDays: number; maxDevices: number | null; transactionHistoryDays: number; active?: boolean };
@@ -63,6 +63,9 @@ export default function App() {
   const [billingNotice, setBillingNotice] = useState("");
   const [billingPayments, setBillingPayments] = useState<BillingPayment[]>([]);
   const [tokenLedger, setTokenLedger] = useState<any[]>([]);
+  const [billingPlansLoading, setBillingPlansLoading] = useState(false);
+  const [billingPlansError, setBillingPlansError] = useState("");
+  const [billingPlanRetry, setBillingPlanRetry] = useState(0);
 
   function navigate(to: string, replace = false) {
     if (replace) window.history.replaceState({}, "", to);
@@ -133,25 +136,38 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!me || !["Overview", "Subscription"].includes(page)) return;
+    const timer = window.setInterval(async () => {
+      try { setMe(await api<Me>("/api/me")); } catch { /* The explicit refresh control remains available. */ }
+    }, 10000);
+    return () => window.clearInterval(timer);
+  }, [me?.id, page]);
+
+  useEffect(() => {
     if (!me || !["Subscription", "Buy Tokens", "Token History"].includes(page)) return;
     let cancelled = false;
     const loadBilling = async () => {
-      try {
-        const [plans, packs, payments, ledger] = await Promise.all([
-          api<BillingPlan[]>("/api/plans"),
-          api<TokenPackage[]>("/api/billing/token-packages"),
-          api<BillingPayment[]>("/api/billing/payments"),
-          api<any[]>("/api/billing/token-ledger")
-        ]);
-        if (cancelled) return;
-        setBillingPlans(plans); setTokenPackages(packs); setBillingPayments(payments); setTokenLedger(ledger);
-      } catch (e) {
-        if (!cancelled) setBillingNotice(e instanceof Error ? e.message : "Could not load billing information");
-      }
+      setBillingPlansLoading(true); setBillingPlansError(""); setBillingPlans([]);
+      void api<BillingPlan[]>("/api/plans").then(plans => {
+        if (!cancelled) setBillingPlans(plans);
+      }).catch(e => {
+        if (!cancelled) setBillingPlansError(e instanceof Error ? e.message : "Could not load subscription plans");
+      }).finally(() => { if (!cancelled) setBillingPlansLoading(false); });
+      const [packs, payments, ledger] = await Promise.allSettled([
+        api<TokenPackage[]>("/api/billing/token-packages"),
+        api<BillingPayment[]>("/api/billing/payments"),
+        api<any[]>("/api/billing/token-ledger")
+      ]);
+      if (cancelled) return;
+      if (packs.status === "fulfilled") setTokenPackages(packs.value);
+      if (payments.status === "fulfilled") setBillingPayments(payments.value);
+      if (ledger.status === "fulfilled") setTokenLedger(ledger.value);
+      const failed = [packs, payments, ledger].find(result => result.status === "rejected");
+      if (failed?.status === "rejected") setBillingNotice(failed.reason instanceof Error ? failed.reason.message : "Could not load billing information");
     };
     void loadBilling();
     return () => { cancelled = true; };
-  }, [me?.id, page]);
+  }, [me?.id, page, billingPlanRetry]);
 
   const role = adminSession ? "ADMIN" : me?.role ?? null;
   const route = resolveRoute(pathname, role);
@@ -300,7 +316,10 @@ export default function App() {
   </div>;
 
   const online = me.devices.filter(d => d.status === "ONLINE").length;
-  const activeSub = me.subscriptions?.find(s => s.status === "ACTIVE" && s.expiresAt && new Date(s.expiresAt) > new Date());
+  const activeSub = me.subscription?.status === "ACTIVE" && me.subscription.expiresAt && new Date(me.subscription.expiresAt) > new Date()
+    ? me.subscription
+    : me.subscriptions?.find(s => s.status === "ACTIVE" && s.expiresAt && new Date(s.expiresAt) > new Date());
+  const effectiveSub = me.subscription ?? activeSub ?? me.subscriptions?.[0] ?? null;
   const title = page === "Overview" ? "Dashboard overview" : page;
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNav ? "open" : ""}`}>
@@ -344,7 +363,25 @@ export default function App() {
         {page==="Approved Signatures"&&<section className="panel"><div className="panel-heading"><div><h3>Approved signatures</h3><p>Approved signatures may be shared only with compatible devices on this account.</p></div></div><Empty title="No signature records to display" detail="Signature upload, version history and revocation endpoints are the next integration step." /></section>}
         {page==="Buy Tokens"&&<section className="panel"><div className="panel-heading"><div><h3>Buy tokens</h3><p>Pay by M-Pesa STK Push. Tokens are credited only after provider verification.</p></div></div><div className="balance-card"><span>Current token balance</span><strong>{me.tokenBalance}</strong><small>Shared account balance</small></div><label className="billing-label">M-Pesa phone number</label><input className="billing-input" value={billingPhone} onChange={e=>setBillingPhone(e.target.value)} placeholder={me.phone || "07XXXXXXXX or 2547XXXXXXXX"} />{billingNotice&&<div className="notice"><ShieldCheck size={18}/><div>{billingNotice}</div></div>}{tokenPackages.length===0?<div className="notice"><ShieldCheck size={18}/><div><strong>Token packages unavailable</strong><p>Please refresh the page or contact support if this continues.</p></div></div>:<div className="plan-grid">{tokenPackages.map(pack=><div className="plan-card" key={pack.code}><span className="plan-label">TOKEN PACKAGE</span><h3>{pack.name}</h3><div className="plan-price">{money(pack.amountKes)}</div><p><CheckCircle2 size={15}/>{pack.tokens.toLocaleString()} tokens</p><button className="primary full" disabled={billingBusy} onClick={()=>void purchaseTokens(pack.code)}>{billingBusy?"Requesting…":"Pay with M-Pesa"}</button></div>)}</div>}</section>}
         {page==="Token History"&&<section className="panel"><div className="panel-heading"><div><h3>Token history</h3><p>Token ledger and payment status.</p></div><button className="icon-button" onClick={()=>void refresh()}><RefreshCw size={16}/></button></div>{tokenLedger.length===0?<Empty title="No token ledger entries" detail="Verified token purchases and ledger adjustments will appear here."/>:<div className="table-wrap"><table><thead><tr><th>Date</th><th>Reason</th><th>Change</th><th>Balance after</th><th>Reference</th></tr></thead><tbody>{tokenLedger.map(entry=><tr key={entry.id}><td>{time(entry.createdAt)}</td><td>{entry.reason}</td><td>{entry.delta>0?"+":""}{entry.delta}</td><td>{entry.balanceAfter}</td><td>{entry.reference}</td></tr>)}</tbody></table></div>}<h3>Recent payments</h3>{billingPayments.length===0?<Empty title="No payments yet" detail="Your PayHero payment attempts will appear here."/>:<div className="table-wrap"><table><thead><tr><th>Date</th><th>Reference</th><th>Purpose</th><th>Amount</th><th>Status</th></tr></thead><tbody>{billingPayments.map(payment=><tr key={payment.id}><td>{time(payment.createdAt)}</td><td>{payment.externalReference}</td><td>{payment.purpose.startsWith("TOKENS:")?"Token purchase":payment.purpose.startsWith("SUBSCRIPTION:")?"Subscription":"Other"}</td><td>{money(payment.amountKes)}</td><td>{payment.status}</td></tr>)}</tbody></table></div>}</section>}
-        {page==="Subscription"&&<><section className="panel"><div className="panel-heading"><div><h3>Choose a subscription</h3><p>Pay with M-Pesa. Your subscription changes only after PayHero verification.</p></div></div><label className="billing-label">M-Pesa phone number</label><input className="billing-input" value={billingPhone} onChange={e=>setBillingPhone(e.target.value)} placeholder={me.phone || "07XXXXXXXX or 2547XXXXXXXX"} />{billingNotice&&<div className="notice"><ShieldCheck size={18}/><div>{billingNotice}</div></div>}<div className="plan-grid">{billingPlans.filter(p=>p.active !== false).map(p=><div className={`plan-card ${activeSub?.plan?.name===p.name?"plan-current":""}`} key={p.id}><span className="plan-label">{activeSub?.plan?.name===p.name?"CURRENT PLAN":`${p.durationDays} DAYS`}</span><h3>{p.name}</h3><div className="plan-price">{money(p.priceKes)}<small>/{p.durationDays} days</small></div><p><CheckCircle2 size={15}/>{p.maxDevices==null?"Unlimited devices":`Up to ${p.maxDevices} devices`}</p><p><CheckCircle2 size={15}/>{p.transactionHistoryDays}-day transaction history</p><button className="primary full" disabled={billingBusy} onClick={()=>void purchaseSubscription(p.id)}>{billingBusy?"Requesting…":activeSub?.plan?.name===p.name?"Renew with M-Pesa":"Subscribe with M-Pesa"}</button></div>)}{billingPlans.filter(p=>p.active !== false).length===0&&<div className="empty"><strong>No subscription plans available</strong><p>The plan catalogue is currently empty. Please refresh later or contact support if this continues.</p><button className="secondary" onClick={()=>void refresh()}>Refresh account</button></div>}</div></section><div className="notice"><CreditCard size={18}/><div><strong>Subscription renewal</strong><p>Your account remains accessible when a subscription expires, but subscription-dependent automation and remote commands must be disabled until renewal is confirmed.</p></div></div></>}
+        {page==="Subscription"&&<>
+          <section className="panel">
+            <div className="panel-heading"><div><h3>Your subscription</h3><p>Current status from your account profile, shared with the dashboard.</p></div><button className="icon-button" onClick={()=>void refresh()} title="Refresh subscription status"><RefreshCw size={16}/></button></div>
+            <div className="settings-row"><div><strong>Status</strong><span className={`tag ${activeSub?"success":"pending"}`}>{activeSub?"ACTIVE":effectiveSub?.status==="ACTIVE"?"EXPIRED":effectiveSub?.status??"INACTIVE"}</span></div></div>
+            <div className="settings-row"><div><strong>Selected plan</strong><span>{effectiveSub?.plan?.name??"No plan selected"}</span></div></div>
+            <div className="settings-row"><div><strong>Activation date</strong><span>{effectiveSub?.startsAt?time(effectiveSub.startsAt):"—"}</span></div></div>
+            <div className="settings-row"><div><strong>Expiry date</strong><span>{effectiveSub?.expiresAt?time(effectiveSub.expiresAt):"—"}</span></div></div>
+          </section>
+          <section className="panel">
+            <div className="panel-heading"><div><h3>Choose a subscription</h3><p>Pay with M-Pesa. Your subscription changes only after PayHero verification.</p></div></div>
+            <label className="billing-label">M-Pesa phone number</label><input className="billing-input" value={billingPhone} onChange={e=>setBillingPhone(e.target.value)} placeholder={me.phone || "07XXXXXXXX or 2547XXXXXXXX"} />
+            {billingNotice&&<div className="notice"><ShieldCheck size={18}/><div>{billingNotice}</div></div>}
+            {billingPlansLoading&&<div className="notice" role="status"><RefreshCw size={18}/><div>Loading available subscription plans…</div></div>}
+            {billingPlansError&&<div className="alert page-alert" role="alert"><span>Could not load subscription plans: {billingPlansError}</span><button type="button" onClick={()=>setBillingPlanRetry(v=>v+1)}>Retry</button></div>}
+            {!billingPlansLoading&&!billingPlansError&&billingPlans.filter(p=>p.active!==false).length===0&&<Empty title="No subscription plans are available" detail="The plan catalogue is currently empty. Refresh to try again, or contact support if the plans remain unavailable." action={<button className="secondary" onClick={()=>setBillingPlanRetry(v=>v+1)}>Retry plan loading</button>} />}
+            {!billingPlansLoading&&billingPlans.filter(p=>p.active!==false).length>0&&<div className="plan-grid">{billingPlans.filter(p=>p.active!==false).map(p=><div className={`plan-card ${activeSub?.plan?.id===p.id?"plan-current":""}`} key={p.id}><span className="plan-label">{activeSub?.plan?.id===p.id?"CURRENT PLAN":`${p.durationDays} DAYS`}</span><h3>{p.name}</h3><div className="plan-price">{money(p.priceKes)}<small>/{p.durationDays} days</small></div><p><CheckCircle2 size={15}/>{p.maxDevices==null?"Unlimited devices":`Up to ${p.maxDevices} devices`}</p><p><CheckCircle2 size={15}/>{p.transactionHistoryDays}-day transaction history</p><button className="primary full" disabled={billingBusy} onClick={()=>void purchaseSubscription(p.id)}>{billingBusy?"Requesting…":activeSub?.plan?.id===p.id?"Renew with M-Pesa":"Subscribe with M-Pesa"}</button></div>)}</div>}
+          </section>
+          <div className="notice"><CreditCard size={18}/><div><strong>Subscription renewal</strong><p>Your account remains accessible when a subscription expires, but subscription-dependent automation and remote commands must be disabled until renewal is confirmed.</p></div></div>
+        </>}
         {page==="Account Settings"&&<section className="panel"><div className="panel-heading"><div><h3>Account settings</h3><p>Profile and account security</p></div></div><div className="settings-row"><div><strong>Phone number</strong><span>{me.phone}</span></div><span className="tag pending">Verification provider required</span></div><div className="settings-row"><div><strong>Account role</strong><span>{me.role}</span></div></div><div className="settings-row"><div><strong>Security</strong><span>Password recovery and phone OTP must be configured before production.</span></div></div><button className="secondary" onClick={logout}><LogOut size={15}/> Sign out</button></section>}
         {page==="Admin Panel"&&<section className="panel"><div className="panel-heading"><div><h3>Administration</h3><p>Restricted account overview. Detailed management actions require separate audited endpoints.</p></div></div><Empty title="Admin overview API is ready" detail="User, subscription, device, payment, token and audit-log management screens need to be wired to role-protected admin endpoints. Separate transaction/signature monitoring pages are intentionally omitted." /></section>}
         <footer className="footer"><span>© 2026 Bingwa Sokoni Portal</span><span><i/> Secure connection architecture</span><span>{loading?"Syncing…":"Last refreshed just now"}</span></footer>
